@@ -369,6 +369,116 @@ def is_placeholder_identifier(value: str | None) -> bool:
     return normalized in {"", "Unknown", "UNKNOWN", "UNKNOWN_PART", "AI_AUTO_DETECT"}
 
 
+def _normalized_identity_text(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def looks_like_context_label(
+    candidate: str | None,
+    *,
+    vehicle_hint: str = "",
+    system_hint: str = "",
+    operator_identifier: str = "",
+) -> bool:
+    normalized_candidate = _normalized_identity_text(candidate)
+    if not normalized_candidate:
+        return False
+
+    vehicle_model_hint, vehicle_year_hint = _split_vehicle_hint(vehicle_hint)
+    known_context_values = [
+        vehicle_hint,
+        vehicle_model_hint,
+        vehicle_year_hint,
+        system_hint,
+        operator_identifier,
+        f"[{vehicle_hint}] {system_hint}" if vehicle_hint and system_hint else "",
+        f"{vehicle_hint} {system_hint}".strip(),
+    ]
+    normalized_contexts = {
+        _normalized_identity_text(value)
+        for value in known_context_values
+        if _normalized_identity_text(value)
+    }
+    return normalized_candidate in normalized_contexts
+
+
+def _split_vehicle_hint(vehicle_hint: str) -> tuple[str, str]:
+    raw_value = str(vehicle_hint or "").strip()
+    if not raw_value:
+        return "", ""
+    match = re.search(r"(19|20)\d{2}", raw_value)
+    if not match:
+        return raw_value, ""
+    year_value = match.group(0)
+    model_value = re.sub(r"(19|20)\d{2}", "", raw_value).strip(" -_/")
+    return model_value, year_value
+
+
+def apply_input_context_to_payload(
+    payload: dict[str, Any],
+    *,
+    schema_key: str,
+    part_number_hint: str = "",
+    vehicle_hint: str = "",
+    system_hint: str = "",
+    operator_identifier: str = "",
+) -> dict[str, Any]:
+    cleaned_part_hint = str(part_number_hint or "").strip()
+    cleaned_vehicle_hint = str(vehicle_hint or "").strip()
+    cleaned_system_hint = str(system_hint or "").strip()
+    cleaned_identifier = str(operator_identifier or "").strip()
+
+    input_context = {
+        "provided_part_number": cleaned_part_hint,
+        "vehicle_hint": cleaned_vehicle_hint,
+        "system_hint": cleaned_system_hint,
+        "operator_identifier": cleaned_identifier,
+    }
+    payload["input_context"] = input_context
+
+    vehicle_model_hint, vehicle_year_hint = _split_vehicle_hint(cleaned_vehicle_hint)
+    if cleaned_vehicle_hint or cleaned_system_hint:
+        vehicle_payload = payload.get("vehicle")
+        if not isinstance(vehicle_payload, dict):
+            vehicle_payload = {}
+        if cleaned_vehicle_hint and not vehicle_payload.get("model"):
+            vehicle_payload["model"] = vehicle_model_hint or cleaned_vehicle_hint
+        if vehicle_year_hint and not vehicle_payload.get("year"):
+            vehicle_payload["year"] = vehicle_year_hint
+        if cleaned_system_hint and not vehicle_payload.get("system_hint"):
+            vehicle_payload["system_hint"] = cleaned_system_hint
+        if vehicle_payload:
+            payload["vehicle"] = vehicle_payload
+
+    current_part_number = str(payload.get("part_number", "") or "").strip()
+    if cleaned_part_hint:
+        if is_placeholder_identifier(current_part_number) or looks_like_context_label(
+            current_part_number,
+            vehicle_hint=cleaned_vehicle_hint,
+            system_hint=cleaned_system_hint,
+            operator_identifier=cleaned_identifier,
+        ):
+            payload["part_number"] = cleaned_part_hint
+    else:
+        if not schema_requires_part_number(schema_key):
+            if is_placeholder_identifier(current_part_number) or looks_like_context_label(
+                current_part_number,
+                vehicle_hint=cleaned_vehicle_hint,
+                system_hint=cleaned_system_hint,
+                operator_identifier=cleaned_identifier,
+            ):
+                payload["part_number"] = "UNKNOWN"
+        elif looks_like_context_label(
+            current_part_number,
+            vehicle_hint=cleaned_vehicle_hint,
+            system_hint=cleaned_system_hint,
+            operator_identifier=cleaned_identifier,
+        ):
+            payload["part_number"] = "UNKNOWN"
+
+    return payload
+
+
 def _extract_vehicle_identifier_examples(raw_text: str) -> dict[str, list[str]]:
     text = raw_text or ""
     upper_text = text.upper()
@@ -429,6 +539,9 @@ def refine_vision_result_and_save(
     source_path_hint: str = "",
     document_type: str = "",
     part_number_hint: str = "",
+    vehicle_hint: str = "",
+    system_hint: str = "",
+    operator_identifier: str = "",
     oem_brand: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     llm = get_cached_llm()
@@ -494,6 +607,14 @@ def refine_vision_result_and_save(
     refined_payload.setdefault("market", market)
     refined_payload["analysis_mode"] = "gemini_refined"
     refined_payload["captured_at"] = datetime.now().isoformat(timespec="seconds")
+    apply_input_context_to_payload(
+        refined_payload,
+        schema_key=schema_key,
+        part_number_hint=part_number_hint,
+        vehicle_hint=vehicle_hint,
+        system_hint=system_hint,
+        operator_identifier=operator_identifier,
+    )
     assess_analysis_quality(refined_payload)
 
     save_gsw_document(
@@ -565,6 +686,8 @@ def build_gsw_document_record(
         part_number = "UNKNOWN"
 
     vehicle = payload.get("vehicle") if isinstance(payload.get("vehicle"), dict) else {}
+    input_context = payload.get("input_context") if isinstance(payload.get("input_context"), dict) else {}
+    inferred_model, inferred_year = _split_vehicle_hint(str(input_context.get("vehicle_hint") or ""))
     breadcrumb_path = _string_list(payload.get("breadcrumbs") or payload.get("breadcrumb_path") or [])
     breadcrumb_text = " > ".join(breadcrumb_path)
     title = str(
@@ -599,8 +722,15 @@ def build_gsw_document_record(
         "oem_brand": oem_brand,
         "brand": str(vehicle.get("brand") or "Hyundai").strip(),
         "market": market,
-        "vehicle_model": str(vehicle.get("model") or payload.get("vehicle_model") or payload.get("model") or "").strip(),
-        "vehicle_year": str(vehicle.get("year") or payload.get("year") or "").strip(),
+        "vehicle_model": str(
+            vehicle.get("model")
+            or payload.get("vehicle_model")
+            or payload.get("model")
+            or inferred_model
+            or input_context.get("vehicle_hint")
+            or ""
+        ).strip(),
+        "vehicle_year": str(vehicle.get("year") or payload.get("year") or inferred_year or "").strip(),
         "vehicle_trim": str(vehicle.get("trim") or payload.get("vehicle_trim") or "").strip(),
         "engine_code": str(vehicle.get("engine") or payload.get("engine_code") or "").strip(),
         "transmission_code": str(vehicle.get("transmission") or payload.get("transmission_code") or "").strip(),
@@ -673,6 +803,9 @@ def process_vision_and_save(
     source_path_hint: str = "",
     document_type: str = "",
     prompt_override: str | None = None,
+    vehicle_hint: str = "",
+    system_hint: str = "",
+    operator_identifier: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     llm = get_cached_llm()
     mime_type = file_type or "image/jpeg"
@@ -730,8 +863,14 @@ def process_vision_and_save(
                 "captured_at": datetime.now().isoformat(timespec="seconds"),
             }
 
-    if not schema_requires_part_number(doc_type_key) and is_placeholder_identifier(payload.get("part_number")):
-        payload["part_number"] = "UNKNOWN"
+    apply_input_context_to_payload(
+        payload,
+        schema_key=doc_type_key,
+        part_number_hint=part_num,
+        vehicle_hint=vehicle_hint,
+        system_hint=system_hint,
+        operator_identifier=operator_identifier,
+    )
     assess_analysis_quality(payload)
 
     save_gsw_document(

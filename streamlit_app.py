@@ -415,18 +415,19 @@ def render_vision_input_mode() -> None:
         part_clean = part_number.strip()
 
         if part_clean:
-            identifier = part_clean
+            operator_identifier = part_clean
         elif vehicle_clean and system_clean:
-            identifier = f"[{vehicle_clean}] {system_clean}"
+            operator_identifier = f"[{vehicle_clean}] {system_clean}"
         elif vehicle_clean or system_clean:
-            identifier = vehicle_clean or system_clean
+            operator_identifier = vehicle_clean or system_clean
         else:
-            identifier = "AI_AUTO_DETECT"
+            operator_identifier = "AI_AUTO_DETECT"
 
         context_lines = [
             f"Vehicle and model year hint: {vehicle_clean or 'Unknown'}",
             f"System or part hint: {system_clean or 'Unknown'}",
-            f"Operator identifier: {identifier}",
+            f"Provided part number hint: {part_clean or 'Unknown'}",
+            f"Operator identifier: {operator_identifier}",
             f"Selected schema key: {schema_key}",
             f"Selected path hint: {path_hint}",
             f"Selected market: {market}",
@@ -438,22 +439,28 @@ def render_vision_input_mode() -> None:
                 + json.dumps(template_hint, ensure_ascii=False, indent=2)
             )
 
-        with st.spinner(f"'{identifier}' 문서를 해독 중입니다. 잠시만 기다려주세요..."):
+        with st.spinner(f"'{operator_identifier}' 문서를 해독 중입니다. 잠시만 기다려주세요..."):
             analysis_result, queue_result = process_vision_and_save(
                 file_bytes=uploaded_file.getvalue(),
                 file_type=uploaded_file.type,
-                part_num=identifier,
+                part_num=part_clean,
                 doc_type_key=schema_key,
                 market=market,
                 source_path_hint=path_hint,
                 document_type=selected_type,
                 prompt_override=f"{prompt_value(schema_key)}{template_block}\n\n" + "\n".join(context_lines),
+                vehicle_hint=vehicle_clean,
+                system_hint=system_clean,
+                operator_identifier=operator_identifier,
             )
 
         analysis_result = assess_analysis_quality(analysis_result)
         st.session_state["last_vision_result"] = analysis_result
         st.session_state["last_vision_context"] = {
-            "identifier": identifier,
+            "operator_identifier": operator_identifier,
+            "part_number_hint": part_clean,
+            "vehicle_hint": vehicle_clean,
+            "system_hint": system_clean,
             "schema_key": schema_key,
             "path_hint": path_hint,
             "market": market,
@@ -502,7 +509,10 @@ def render_vision_input_mode() -> None:
                         market=context.get("market", last_result.get("market", "GLOBAL")),
                         source_path_hint=context.get("path_hint", last_result.get("source_path_hint", "")),
                         document_type=context.get("document_type", last_result.get("document_type", "")),
-                        part_number_hint=context.get("identifier", last_result.get("part_number", "")),
+                        part_number_hint=context.get("part_number_hint", last_result.get("part_number", "")),
+                        vehicle_hint=context.get("vehicle_hint", ""),
+                        system_hint=context.get("system_hint", ""),
+                        operator_identifier=context.get("operator_identifier", ""),
                         oem_brand=last_result.get("oem_brand", ""),
                     )
                 st.session_state["last_vision_result"] = refined_result
