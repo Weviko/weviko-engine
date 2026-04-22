@@ -23,6 +23,8 @@ class VisionFactBundle(BaseModel):
 
     part_number: str = Field(default="Unknown", description="Detected automotive part number.")
     oem_brand: str = Field(default="", description="OEM brand associated with the part.")
+    schema_key: str = Field(default="", description="Internal schema key selected by the operator.")
+    source_path_hint: str = Field(default="", description="Source path hint selected by the operator.")
     document_type: str = Field(default="Unknown", description="Detected document type.")
     summary: str = Field(default="", description="Short summary of the image contents.")
     extracted_facts: dict[str, Any] = Field(
@@ -312,6 +314,8 @@ def analyze_uploaded_image(
     mime_type: str,
     part_number: str,
     oem_brand: str,
+    schema_key: str,
+    source_path_hint: str,
     document_type: str,
     prompt_text: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -320,6 +324,8 @@ def analyze_uploaded_image(
         fallback = {
             "part_number": part_number or "Unknown",
             "oem_brand": oem_brand,
+            "schema_key": schema_key,
+            "source_path_hint": source_path_hint,
             "document_type": document_type,
             "summary": "Gemini가 설정되지 않아 예시 기반 Vision 결과를 반환했습니다.",
             "extracted_facts": {
@@ -338,6 +344,8 @@ def analyze_uploaded_image(
         f"Requested document type: {document_type}\n"
         f"User supplied part number: {part_number or 'Unknown'}\n"
         f"User supplied OEM brand: {oem_brand or 'Unknown'}\n"
+        f"Selected schema key: {schema_key or 'Unknown'}\n"
+        f"Selected path hint: {source_path_hint or 'Unknown'}\n"
         "Return only structured automotive facts. Keep units and ranges exactly as shown. "
         "If the user supplied part number or OEM brand is valid and the image is ambiguous, prefer the supplied values."
     )
@@ -356,6 +364,10 @@ def analyze_uploaded_image(
         payload["part_number"] = part_number
     if oem_brand and not payload.get("oem_brand"):
         payload["oem_brand"] = oem_brand
+    if schema_key and not payload.get("schema_key"):
+        payload["schema_key"] = schema_key
+    if source_path_hint and not payload.get("source_path_hint"):
+        payload["source_path_hint"] = source_path_hint
     payload["document_type"] = document_type or payload.get("document_type", "Unknown")
     payload["captured_at"] = datetime.now().isoformat(timespec="seconds")
     payload["analysis_mode"] = "gemini"
@@ -365,6 +377,8 @@ def analyze_uploaded_image(
         {
             "part_number": payload.get("part_number", "Unknown"),
             "oem_brand": payload.get("oem_brand", ""),
+            "schema_key": payload.get("schema_key", ""),
+            "source_path_hint": payload.get("source_path_hint", ""),
             "document_type": payload.get("document_type", "Unknown"),
             "analysis": payload,
             "created_at": _utc_now_iso(),
@@ -377,6 +391,8 @@ def enqueue_pending_vision_result(
     *,
     part_number: str,
     oem_brand: str,
+    schema_key: str,
+    source_path_hint: str,
     market: str,
     document_type: str,
     analysis_payload: dict[str, Any],
@@ -385,6 +401,8 @@ def enqueue_pending_vision_result(
     payload = {
         "part_number": part_number or analysis_payload.get("part_number", "Unknown"),
         "oem_brand": oem_brand or analysis_payload.get("oem_brand", ""),
+        "schema_key": schema_key or analysis_payload.get("schema_key", ""),
+        "source_path_hint": source_path_hint or analysis_payload.get("source_path_hint", ""),
         "market": market,
         "document_type": document_type,
         "source_type": source_type,
@@ -405,6 +423,8 @@ def _build_translation_source(record: dict[str, Any]) -> dict[str, Any]:
         "url": record.get("url", ""),
         "part_number": record.get("part_number", ""),
         "oem_brand": record.get("oem_brand", ""),
+        "schema_key": record.get("schema_key", ""),
+        "source_path_hint": record.get("source_path_hint", ""),
         "target_market": record.get("target_market", ""),
         "spec_data": record.get("spec_data") or record.get("extracted_facts", {}),
         "status": record.get("status", ""),
@@ -451,6 +471,8 @@ def translate_record(
             "source_url": record.get("url", ""),
             "part_number": record.get("part_number", ""),
             "oem_brand": record.get("oem_brand", ""),
+            "schema_key": record.get("schema_key", ""),
+            "source_path_hint": record.get("source_path_hint", ""),
             "translations": payload,
             "created_at": _utc_now_iso(),
         },
@@ -495,6 +517,8 @@ def approve_pending_item(
             {
                 "part_number": item.get("part_number") or edited_payload.get("part_number", "Unknown"),
                 "oem_brand": item.get("oem_brand") or edited_payload.get("oem_brand", ""),
+                "schema_key": item.get("schema_key") or edited_payload.get("schema_key", ""),
+                "source_path_hint": item.get("source_path_hint") or edited_payload.get("source_path_hint", ""),
                 "market": item.get("market", "GLOBAL"),
                 "document_type": item.get("document_type", ""),
                 "source_type": item.get("source_type", ""),
@@ -645,6 +669,8 @@ def persist_review_decision(
         "final_url": reviewed_record.get("final_url") or original_record.get("final_url", ""),
         "part_number": reviewed_record.get("part_number") or original_record.get("part_number") or "Unknown",
         "oem_brand": reviewed_record.get("oem_brand") or original_record.get("oem_brand", ""),
+        "schema_key": reviewed_record.get("schema_key") or original_record.get("schema_key", ""),
+        "source_path_hint": reviewed_record.get("source_path_hint") or original_record.get("source_path_hint", ""),
         "decision": decision,
         "notes": notes,
         "review_payload": reviewed_record,
@@ -669,6 +695,10 @@ def persist_review_decision(
                         or "Unknown",
                         "oem_brand": reviewed_record.get("oem_brand")
                         or original_record.get("oem_brand", ""),
+                        "schema_key": reviewed_record.get("schema_key")
+                        or original_record.get("schema_key", ""),
+                        "source_path_hint": reviewed_record.get("source_path_hint")
+                        or original_record.get("source_path_hint", ""),
                         "extracted_facts": reviewed_record.get("extracted_facts")
                         or original_record.get("extracted_facts")
                         or {},

@@ -32,6 +32,14 @@ load_dotenv()
 
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "weviko1234!")
 
+WEVIKO_PATH_MAP = {
+    "🛠️ 정비 지침서 (/shop/manual/)": "path_manual",
+    "⚙️ 부품 제원/호환성 (/item/detail/)": "path_detail",
+    "⚡ 회로도/배선도 (/contents/etc/)": "path_wiring",
+    "🗣️ 포럼/실전 팁 (/community/)": "path_community",
+    "⚠️ 고장 코드(DTC) (/dtc/)": "path_dtc",
+}
+
 DEFAULT_PROMPTS = {
     "crawling_ecommerce": (
         "자동차 부품 상세 페이지에서 부품번호, 차종, 연식, 호환 조건, 규격, 토크, "
@@ -44,6 +52,21 @@ DEFAULT_PROMPTS = {
     "translation_vn": (
         "자동차 정비/부품 구조화 데이터를 영어(en)와 베트남어(vn)로 번역하세요. "
         "전문 정비 용어를 사용하고, 숫자, 단위, 부품번호는 원형을 유지하세요."
+    ),
+    "path_manual": (
+        "정비 지침서 성격의 자료입니다. 작업 순서, 공구, 토크, 주의사항, 분해/조립 절차를 구조화하세요."
+    ),
+    "path_detail": (
+        "부품 제원/호환성 페이지입니다. 부품번호, 규격, OEM 정보, 적용 차종, 연식, 호환 조건을 우선 추출하세요."
+    ),
+    "path_wiring": (
+        "회로도/배선도 자료입니다. 커넥터, 핀, 회로명, 전압/저항 등 계측 가능한 사실만 구조화하세요."
+    ),
+    "path_community": (
+        "포럼/실전 팁 자료입니다. 검증 가능한 정비 팁, 증상, 해결법, 반복되는 오류 패턴만 요약하세요."
+    ),
+    "path_dtc": (
+        "고장 코드(DTC) 자료입니다. 코드, 증상, 원인, 점검 절차, 권장 조치를 구조화하세요."
     ),
 }
 
@@ -227,6 +250,13 @@ def prompt_value(prompt_key: str) -> str:
     return prompts.get(prompt_key, DEFAULT_PROMPTS[prompt_key])
 
 
+def resolve_path_selection(selected_label: str, direct_path: str) -> tuple[str, str]:
+    if selected_label == "직접 입력...":
+        return "path_manual", direct_path.strip()
+    raw_path = selected_label.split("(")[1].split(")")[0]
+    return WEVIKO_PATH_MAP[selected_label], raw_path
+
+
 def render_sidebar() -> str:
     with st.sidebar:
         st.title("🌍 Weviko OS v4.0")
@@ -248,9 +278,20 @@ def render_vision_input_mode() -> None:
     document_type = col3.selectbox("문서 종류", ["정비 지침", "도해도/스펙", "회로도"])
     market = col4.selectbox("시장", ["GLOBAL", "VN", "KR", "US"])
 
+    selected_label = st.selectbox(
+        "수집 경로 및 종류 선택",
+        options=list(WEVIKO_PATH_MAP.keys()) + ["직접 입력..."],
+        help="수집하려는 정보의 종류에 맞는 경로를 선택하세요. AI 스키마가 자동으로 매핑됩니다.",
+    )
+    direct_path = ""
+    if selected_label == "직접 입력...":
+        direct_path = st.text_input("새로운 경로 패턴 입력", placeholder="/new/path/")
+    schema_key, path_hint = resolve_path_selection(selected_label, direct_path)
+    st.caption(f"📍 현재 활성화된 AI 스키마: `{schema_key}` | 탐색 경로: `{path_hint}`")
+
     prompt_text = st.text_area(
         "Vision 프롬프트",
-        value=prompt_value("vision_gsw"),
+        value=prompt_value(schema_key),
         height=120,
     )
     uploaded_file = st.file_uploader("스크린샷 업로드", type=["png", "jpg", "jpeg", "webp"])
@@ -269,12 +310,16 @@ def render_vision_input_mode() -> None:
                 mime_type=uploaded_file.type or "image/png",
                 part_number=part_number.strip(),
                 oem_brand=oem_brand.strip(),
+                schema_key=schema_key,
+                source_path_hint=path_hint,
                 document_type=document_type,
-                prompt_text=prompt_text,
+                prompt_text=f"{prompt_text}\n\nSelected schema key: {schema_key}\nSelected path hint: {path_hint}",
             )
             queue_result = enqueue_pending_vision_result(
                 part_number=part_number.strip(),
                 oem_brand=oem_brand.strip(),
+                schema_key=schema_key,
+                source_path_hint=path_hint,
                 market=market,
                 document_type=document_type,
                 analysis_payload=analysis_result,
@@ -408,7 +453,19 @@ def render_translation_mode() -> None:
 
 def render_prompt_mode() -> None:
     st.title("⚙️ AI 프롬프트 중앙 관리")
-    prompt_key = st.selectbox("관리할 프롬프트", ["crawling_ecommerce", "vision_gsw", "translation_vn"])
+    prompt_key = st.selectbox(
+        "관리할 프롬프트",
+        [
+            "crawling_ecommerce",
+            "vision_gsw",
+            "translation_vn",
+            "path_manual",
+            "path_detail",
+            "path_wiring",
+            "path_community",
+            "path_dtc",
+        ],
+    )
     current_value, source = get_config_prompt(prompt_key, DEFAULT_PROMPTS[prompt_key])
     new_value = st.text_area("프롬프트 내용", value=current_value, height=220)
     st.caption(f"현재 로드 소스: {source}")

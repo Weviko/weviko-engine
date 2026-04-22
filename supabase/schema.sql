@@ -7,6 +7,8 @@ create extension if not exists pgcrypto;
 create table if not exists public.parts (
   part_number text primary key,
   oem_brand text,
+  schema_key text,
+  source_path_hint text,
   market text,
   document_type text,
   source_type text,
@@ -17,6 +19,8 @@ create table if not exists public.parts (
 );
 
 alter table public.parts add column if not exists oem_brand text;
+alter table public.parts add column if not exists schema_key text;
+alter table public.parts add column if not exists source_path_hint text;
 alter table public.parts add column if not exists market text;
 alter table public.parts add column if not exists document_type text;
 alter table public.parts add column if not exists source_type text;
@@ -27,6 +31,7 @@ alter table public.parts add column if not exists updated_at timestamptz not nul
 
 create index if not exists idx_parts_market on public.parts (market);
 create index if not exists idx_parts_oem_brand on public.parts (oem_brand);
+create index if not exists idx_parts_schema_key on public.parts (schema_key);
 create index if not exists idx_parts_created_at on public.parts (created_at desc);
 
 -- 2. Pending review queue
@@ -34,6 +39,8 @@ create table if not exists public.pending_data (
   id uuid primary key default gen_random_uuid(),
   part_number text,
   oem_brand text,
+  schema_key text,
+  source_path_hint text,
   market text,
   document_type text,
   source_type text,
@@ -46,6 +53,8 @@ create table if not exists public.pending_data (
 
 alter table public.pending_data add column if not exists part_number text;
 alter table public.pending_data add column if not exists oem_brand text;
+alter table public.pending_data add column if not exists schema_key text;
+alter table public.pending_data add column if not exists source_path_hint text;
 alter table public.pending_data add column if not exists market text;
 alter table public.pending_data add column if not exists document_type text;
 alter table public.pending_data add column if not exists source_type text;
@@ -57,6 +66,7 @@ alter table public.pending_data add column if not exists rejected_at timestamptz
 
 create index if not exists idx_pending_data_status on public.pending_data (status);
 create index if not exists idx_pending_data_oem_brand on public.pending_data (oem_brand);
+create index if not exists idx_pending_data_schema_key on public.pending_data (schema_key);
 create index if not exists idx_pending_data_created_at on public.pending_data (created_at desc);
 
 -- 3. Prompt/config store
@@ -103,6 +113,26 @@ values
   (
     'translation_vn',
     '자동차 정비/부품 구조화 데이터를 영어(en)와 베트남어(vn)로 번역하세요. 전문 정비 용어를 사용하고, 숫자, 단위, 부품번호는 원형을 유지하세요.'
+  ),
+  (
+    'path_manual',
+    '정비 지침서 성격의 자료입니다. 작업 순서, 공구, 토크, 주의사항, 분해/조립 절차를 구조화하세요.'
+  ),
+  (
+    'path_detail',
+    '부품 제원/호환성 페이지입니다. 부품번호, 규격, OEM 정보, 적용 차종, 연식, 호환 조건을 우선 추출하세요.'
+  ),
+  (
+    'path_wiring',
+    '회로도/배선도 자료입니다. 커넥터, 핀, 회로명, 전압/저항 등 계측 가능한 사실만 구조화하세요.'
+  ),
+  (
+    'path_community',
+    '포럼/실전 팁 자료입니다. 검증 가능한 정비 팁, 증상, 해결법, 반복되는 오류 패턴만 요약하세요.'
+  ),
+  (
+    'path_dtc',
+    '고장 코드(DTC) 자료입니다. 코드, 증상, 원인, 점검 절차, 권장 조치를 구조화하세요.'
   )
 on conflict (prompt_key) do update
 set
