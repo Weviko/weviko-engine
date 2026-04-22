@@ -97,6 +97,18 @@ def parts_table_name() -> str:
     return os.getenv("WEVIKO_PARTS_TABLE", "parts").strip() or "parts"
 
 
+def pending_table_name() -> str:
+    return os.getenv("WEVIKO_PENDING_TABLE", "pending_data").strip() or "pending_data"
+
+
+def configs_table_name() -> str:
+    return os.getenv("WEVIKO_CONFIGS_TABLE", "configs").strip() or "configs"
+
+
+def dead_letters_table_name() -> str:
+    return os.getenv("WEVIKO_DEAD_LETTERS_TABLE", "dead_letters").strip() or "dead_letters"
+
+
 def load_prompt_templates(defaults: dict[str, str]) -> tuple[dict[str, str], str]:
     prompts = dict(defaults)
     source = "defaults"
@@ -125,6 +137,40 @@ def load_prompt_templates(defaults: dict[str, str]) -> tuple[dict[str, str], str
                     source = "supabase"
         except Exception:
             pass
+
+    return prompts, source
+
+
+def load_config_prompts(defaults: dict[str, str]) -> tuple[dict[str, str], str]:
+    prompts = dict(defaults)
+    source = "defaults"
+    prompt_file = _prompt_store_path()
+
+    if prompt_file.exists():
+        try:
+            local_prompts = json.loads(prompt_file.read_text(encoding="utf-8"))
+            if isinstance(local_prompts, dict):
+                for name, text in local_prompts.items():
+                    if isinstance(name, str) and isinstance(text, str) and text.strip():
+                        prompts[name] = text
+                source = "local_file"
+        except Exception:
+            pass
+
+    client = get_cached_supabase_client()
+    if client is None:
+        return prompts, source
+
+    try:
+        response = client.table(configs_table_name()).select("prompt_key,prompt_value").execute()
+        for row in getattr(response, "data", []) or []:
+            prompt_key = row.get("prompt_key")
+            prompt_value = row.get("prompt_value")
+            if prompt_key and prompt_value:
+                prompts[str(prompt_key)] = str(prompt_value)
+                source = "supabase"
+    except Exception:
+        pass
 
     return prompts, source
 
@@ -161,6 +207,49 @@ def save_prompt_template(name: str, prompt_text: str) -> dict[str, Any]:
         result["remote_saved"] = True
         result["source"] = "supabase"
         result["message"] = "Supabase와 로컬 파일에 저장되었습니다."
+    except Exception as exc:
+        result["message"] = f"로컬 파일 저장은 성공했고, Supabase 저장은 실패했습니다: {exc}"
+
+    return result
+
+
+def get_config_prompt(prompt_key: str, fallback_text: str) -> tuple[str, str]:
+    prompts, source = load_config_prompts({prompt_key: fallback_text})
+    return prompts.get(prompt_key, fallback_text), source
+
+
+def save_config_prompt(prompt_key: str, prompt_text: str) -> dict[str, Any]:
+    prompts, _ = load_config_prompts({})
+    prompts[prompt_key] = prompt_text
+    prompt_file = _prompt_store_path()
+    prompt_file.write_text(
+        json.dumps(prompts, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    result = {
+        "local_saved": True,
+        "remote_saved": False,
+        "source": "local_file",
+        "message": "프롬프트를 로컬 파일에 저장했습니다.",
+    }
+
+    client = get_cached_supabase_client()
+    if client is None:
+        return result
+
+    try:
+        client.table(configs_table_name()).upsert(
+            {
+                "prompt_key": prompt_key,
+                "prompt_value": prompt_text,
+                "updated_at": _utc_now_iso(),
+            },
+            on_conflict="prompt_key",
+        ).execute()
+        result["remote_saved"] = True
+        result["source"] = "supabase"
+        result["message"] = "프롬프트를 Supabase와 로컬 파일에 저장했습니다."
     except Exception as exc:
         result["message"] = f"로컬 파일 저장은 성공했고, Supabase 저장은 실패했습니다: {exc}"
 
@@ -277,12 +366,37 @@ def analyze_uploaded_image(
     return payload, {"saved": saved, "message": message_text}
 
 
+def enqueue_pending_vision_result(
+    *,
+    part_number: str,
+    market: str,
+    document_type: str,
+    analysis_payload: dict[str, Any],
+    source_type: str = "vision_capture",
+) -> dict[str, Any]:
+    payload = {
+        "part_number": part_number or analysis_payload.get("part_number", "Unknown"),
+        "market": market,
+        "document_type": document_type,
+        "source_type": source_type,
+        "raw_json": analysis_payload,
+        "status": "pending",
+        "created_at": _utc_now_iso(),
+    }
+    saved, message = _insert_remote(pending_table_name(), payload)
+    return {
+        "saved": saved,
+        "message": message,
+        "payload": payload,
+    }
+
+
 def _build_translation_source(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "url": record.get("url", ""),
         "part_number": record.get("part_number", ""),
         "target_market": record.get("target_market", ""),
-        "extracted_facts": record.get("extracted_facts", {}),
+        "spec_data": record.get("spec_data") or record.get("extracted_facts", {}),
         "status": record.get("status", ""),
         "route_status": record.get("route_status", ""),
     }
@@ -331,6 +445,180 @@ def translate_record(
         },
     )
     return payload, {"saved": saved, "message": message_text}
+
+
+def fetch_pending_items(limit: int = 20) -> list[dict[str, Any]]:
+    client = get_cached_supabase_client()
+    if client is None:
+        return []
+
+    try:
+        response = (
+            client.table(pending_table_name())
+            .select("*")
+            .eq("status", "pending")
+            .order("created_at", desc=False)
+            .limit(limit)
+            .execute()
+        )
+        return list(getattr(response, "data", []) or [])
+    except Exception:
+        return []
+
+
+def approve_pending_item(
+    *,
+    item_id: Any,
+    item: dict[str, Any],
+    edited_payload: dict[str, Any],
+) -> dict[str, Any]:
+    client = get_cached_supabase_client()
+    if client is None:
+        return {
+            "saved": False,
+            "message": "Supabase가 설정되지 않아 승인 이관을 진행할 수 없습니다.",
+        }
+
+    try:
+        client.table(parts_table_name()).upsert(
+            {
+                "part_number": item.get("part_number") or edited_payload.get("part_number", "Unknown"),
+                "market": item.get("market", "GLOBAL"),
+                "document_type": item.get("document_type", ""),
+                "source_type": item.get("source_type", ""),
+                "spec_data": edited_payload,
+                "updated_at": _utc_now_iso(),
+            },
+            on_conflict="part_number",
+        ).execute()
+        client.table(pending_table_name()).update(
+            {
+                "status": "approved",
+                "approved_at": _utc_now_iso(),
+                "raw_json": edited_payload,
+            }
+        ).eq("id", item_id).execute()
+        return {
+            "saved": True,
+            "message": "정식 parts 테이블로 이관했고 pending_data 상태를 approved로 갱신했습니다.",
+        }
+    except Exception as exc:
+        return {
+            "saved": False,
+            "message": f"승인 이관 실패: {exc}",
+        }
+
+
+def reject_pending_item(item_id: Any) -> dict[str, Any]:
+    client = get_cached_supabase_client()
+    if client is None:
+        return {
+            "saved": False,
+            "message": "Supabase가 설정되지 않아 반려 처리를 진행할 수 없습니다.",
+        }
+
+    try:
+        client.table(pending_table_name()).update(
+            {
+                "status": "rejected",
+                "rejected_at": _utc_now_iso(),
+            }
+        ).eq("id", item_id).execute()
+        return {
+            "saved": True,
+            "message": "pending_data 상태를 rejected로 갱신했습니다.",
+        }
+    except Exception as exc:
+        return {
+            "saved": False,
+            "message": f"반려 처리 실패: {exc}",
+        }
+
+
+def fetch_untranslated_parts(limit: int = 5) -> list[dict[str, Any]]:
+    client = get_cached_supabase_client()
+    if client is None:
+        return []
+
+    try:
+        response = (
+            client.table(parts_table_name())
+            .select("*")
+            .is_("translations", "null")
+            .limit(limit)
+            .execute()
+        )
+        return list(getattr(response, "data", []) or [])
+    except Exception:
+        return []
+
+
+def save_part_translation(part_number: str, translations: dict[str, Any]) -> dict[str, Any]:
+    client = get_cached_supabase_client()
+    if client is None:
+        return {
+            "saved": False,
+            "message": "Supabase가 설정되지 않아 번역 결과를 저장할 수 없습니다.",
+        }
+
+    try:
+        client.table(parts_table_name()).update(
+            {
+                "translations": translations,
+                "updated_at": _utc_now_iso(),
+            }
+        ).eq("part_number", part_number).execute()
+        return {
+            "saved": True,
+            "message": "parts 테이블에 translations를 저장했습니다.",
+        }
+    except Exception as exc:
+        return {
+            "saved": False,
+            "message": f"번역 저장 실패: {exc}",
+        }
+
+
+def fetch_dead_letters(limit: int = 200) -> list[dict[str, Any]]:
+    client = get_cached_supabase_client()
+    if client is None:
+        return []
+
+    try:
+        response = (
+            client.table(dead_letters_table_name())
+            .select("*")
+            .eq("resolved", False)
+            .limit(limit)
+            .execute()
+        )
+        return list(getattr(response, "data", []) or [])
+    except Exception:
+        return []
+
+
+def fetch_parts_export() -> list[dict[str, Any]]:
+    client = get_cached_supabase_client()
+    if client is None:
+        return []
+
+    try:
+        response = client.table(parts_table_name()).select("*").execute()
+        return list(getattr(response, "data", []) or [])
+    except Exception:
+        return []
+
+
+def fetch_parts_count() -> int:
+    client = get_cached_supabase_client()
+    if client is None:
+        return 0
+
+    try:
+        response = client.table(parts_table_name()).select("part_number", count="exact").execute()
+        return int(getattr(response, "count", 0) or 0)
+    except Exception:
+        return 0
 
 
 def persist_review_decision(
