@@ -1,6 +1,11 @@
 {
   "folders": [
     {
+      "name": "weviko-engine",
+      "path": "."
+    },
+    {
+      "name": "autoplatform",
       "path": "autoplatform"
     }
   ]

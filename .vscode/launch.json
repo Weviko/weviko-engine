@@ -1,0 +1,29 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Streamlit: Weviko Master OS",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "streamlit",
+      "args": [
+        "run",
+        "streamlit_app.py",
+        "--server.address",
+        "0.0.0.0",
+        "--server.port",
+        "8501"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Python: main crawler",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}

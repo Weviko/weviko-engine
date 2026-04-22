@@ -1,0 +1,33 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}\\.venv313\\Scripts\\python.exe",
+  "python.terminal.activateEnvironment": true,
+  "python.envFile": "${workspaceFolder}\\.env",
+  "terminal.integrated.cwd": "${workspaceFolder}",
+  "editor.formatOnSave": true,
+  "files.eol": "\n",
+  "files.insertFinalNewline": true,
+  "files.trimTrailingWhitespace": true,
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "**/.mypy_cache": true,
+    "**/.ruff_cache": true,
+    ".venv": true,
+    ".venv313": true,
+    "venv": true,
+    "node_modules": true
+  },
+  "search.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "**/.mypy_cache": true,
+    "**/.ruff_cache": true,
+    ".venv": true,
+    ".venv313": true,
+    "venv": true,
+    "node_modules": true
+  },
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.black-formatter"
+  }
+}
