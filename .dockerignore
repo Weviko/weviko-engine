@@ -6,8 +6,6 @@
 !.dockerignore
 !main.py
 !requirements.txt
-!requirements-weviko-crawler.txt
-!requirements-streamlit.txt
 !streamlit_app.py
 !streamlit_services.py
 !weviko_factory.py
