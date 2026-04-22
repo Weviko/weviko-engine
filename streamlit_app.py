@@ -7,6 +7,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+from weviko_engine import run_crawler_sync
 from weviko_factory import run_factory
 
 from streamlit_services import (
@@ -20,6 +21,7 @@ from streamlit_services import (
     llm_available,
     load_config_prompts,
     persist_factory_rows,
+    process_scraped_text_and_save,
     process_vision_and_save,
     reject_pending_item,
     save_config_prompt,
@@ -395,6 +397,15 @@ def render_factory_mode() -> None:
         placeholder="예: https://www.weviko.com/community/parts-info",
     )
 
+    execution_mode = st.radio(
+        "실행 모드",
+        [
+            "단일 타겟 엔진",
+            "하위 URL 병렬 팩토리",
+        ],
+        horizontal=True,
+    )
+
     col1, col2 = st.columns(2)
     selected_schema_label = col1.selectbox("수집 타겟 및 스키마", list(FACTORY_SCHEMA_OPTIONS.keys()))
     worker_count = col2.slider(
@@ -429,6 +440,60 @@ def render_factory_mode() -> None:
             st.error("시작 URL을 입력해주세요.")
             return
 
+        destination = "pending" if destination_label.startswith("1") else "parts"
+
+        if execution_mode == "단일 타겟 엔진":
+            if not llm_available() or not supabase_available():
+                st.error("환경 변수(Supabase/Google API)가 설정되지 않았습니다.")
+                return
+
+            with st.spinner(f"'{start_url.strip()}' 타겟 수집 및 AI 정제 중..."):
+                scraped_text = run_crawler_sync(
+                    start_url.strip(),
+                    proxy=proxy_value.strip() or None,
+                    user_agent=user_agent_value.strip() or None,
+                )
+
+            if not scraped_text:
+                st.error("❌ 크롤링 실패 (방화벽 차단 또는 타임아웃). 실패 URL 병원을 확인하세요.")
+                return
+
+            payload, save_result = process_scraped_text_and_save(
+                scraped_text=scraped_text,
+                doc_type_key=schema_key,
+                market="GLOBAL",
+                destination=destination,
+                source_path_hint=path_hint,
+                document_type=selected_schema_label,
+            )
+
+            st.session_state["last_factory_result"] = {
+                "mode": "single_target",
+                "payload": payload,
+                "persist": save_result,
+                "scraped_chars": len(scraped_text),
+                "start_url": start_url.strip(),
+            }
+
+            if save_result.get("saved"):
+                actual_destination = save_result.get("destination", "Pending")
+                destination_name = {
+                    "Direct": "정식 DB(Parts)",
+                    "Pending": "검수 대기열(Pending)",
+                }.get(actual_destination, actual_destination)
+                st.success(f"✅ 수집 성공! [{destination_name}]로 반영되었습니다.")
+            else:
+                st.error(save_result.get("message", "크롤링 결과 저장에 실패했습니다."))
+
+            st.caption(
+                f"수집 텍스트 길이: {len(scraped_text):,}자 | "
+                f"스키마: `{schema_key}` | 경로 힌트: `{path_hint}`"
+            )
+            st.caption(save_result.get("message", ""))
+            st.json(payload)
+            return
+
+        progress_box = st.empty()
         log_box = st.empty()
         logs: list[str] = []
 
@@ -437,12 +502,13 @@ def render_factory_mode() -> None:
             log_box.code("\n".join(logs[-30:]), language="bash")
 
         previous_proxy = os.getenv("PLAYWRIGHT_PROXY_SERVER")
-        destination = "pending" if destination_label.startswith("1️⃣") else "parts"
+        destination = "pending" if destination_label.startswith("1") else "parts"
 
         if proxy_value.strip():
             os.environ["PLAYWRIGHT_PROXY_SERVER"] = proxy_value.strip()
 
         try:
+            progress_box.info("스파이더가 하위 URL을 수집하고 있습니다...")
             with st.spinner("스파이더가 URL을 수집하고 AI 정제를 진행 중입니다..."):
                 run_result = run_factory(
                     start_url=start_url.strip(),
@@ -464,6 +530,7 @@ def render_factory_mode() -> None:
             else:
                 os.environ["PLAYWRIGHT_PROXY_SERVER"] = previous_proxy
 
+        progress_box.info("수집 결과를 목적지에 맞게 정리하고 있습니다...")
         persist_result = persist_factory_rows(
             rows=run_result.rows,
             destination=destination,
@@ -479,8 +546,11 @@ def render_factory_mode() -> None:
             "persist": persist_result,
         }
 
+        progress_box.empty()
+        destination_name = "검수 대기열(Pending)" if destination == "pending" else "정식 DB(Parts)"
         st.success(
-            f"✅ URL {len(run_result.queued_urls):,}개 탐색 완료, 결과 {persist_result['saved_count']:,}건 저장"
+            f"✅ 총 {len(run_result.queued_urls):,}개의 URL 탐색 완료. "
+            f"결과 {persist_result['saved_count']:,}건을 {destination_name}에 반영했습니다."
         )
         st.caption(persist_result["message"])
 

@@ -22,6 +22,7 @@ COPY main.py ./main.py
 COPY streamlit_app.py ./streamlit_app.py
 COPY streamlit_services.py ./streamlit_services.py
 COPY weviko_factory.py ./weviko_factory.py
+COPY weviko_engine.py ./weviko_engine.py
 
 RUN useradd --create-home --uid 10001 appuser && \
     chown -R appuser:appuser /app

@@ -438,6 +438,81 @@ def process_vision_and_save(
     }
 
 
+def process_scraped_text_and_save(
+    scraped_text: str,
+    doc_type_key: str,
+    market: str,
+    destination: str,
+    *,
+    part_number_hint: str = "",
+    source_path_hint: str = "",
+    document_type: str = "",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    llm = get_cached_llm()
+    client = get_cached_supabase_client()
+
+    if client is None:
+        return {}, {"saved": False, "message": "Supabase가 설정되지 않았습니다."}
+    if llm is None:
+        return {}, {"saved": False, "message": "Google API / Gemini가 설정되지 않았습니다."}
+
+    system_prompt = get_system_prompt(
+        doc_type_key,
+        "자동차 부품/정비 텍스트에서 측정 가능한 팩트와 식별 정보만 JSON으로 추출하세요.",
+    )
+    msg = HumanMessage(
+        content=[
+            {"type": "text", "text": system_prompt},
+            {"type": "text", "text": f"[수집된 원본 텍스트]\n{scraped_text}"},
+        ]
+    )
+
+    response = llm.invoke([msg])
+    raw_text = _extract_response_text(getattr(response, "content", response))
+    payload = _parse_json_text(raw_text)
+    payload.setdefault("part_number", part_number_hint or "UNKNOWN_PART")
+    payload.setdefault("source_path_hint", source_path_hint)
+    payload.setdefault("schema_key", doc_type_key)
+    payload.setdefault("market", market)
+    payload["scraped_at"] = datetime.now().isoformat(timespec="seconds")
+
+    temp_part_number = str(payload.get("part_number") or part_number_hint or "UNKNOWN_PART").strip()
+
+    if destination == "parts":
+        save_result = save_crawled_data(
+            payload,
+            temp_part_number,
+            market=market,
+            schema_key=doc_type_key,
+            source_path_hint=source_path_hint,
+            source_type=doc_type_key,
+            document_type=document_type or doc_type_key,
+        )
+        return payload, save_result
+
+    try:
+        client.table(pending_table_name()).insert(
+            {
+                "part_number": temp_part_number,
+                "market": market,
+                "schema_key": doc_type_key,
+                "source_path_hint": source_path_hint,
+                "document_type": document_type or doc_type_key,
+                "source_type": doc_type_key,
+                "raw_json": payload,
+                "status": "pending",
+                "created_at": _utc_now_iso(),
+            }
+        ).execute()
+        return payload, {
+            "saved": True,
+            "destination": "Pending",
+            "message": "수집 결과를 검수 대기열에 저장했습니다.",
+        }
+    except Exception as exc:
+        return payload, {"saved": False, "destination": "none", "message": f"저장 실패: {exc}"}
+
+
 def analyze_uploaded_image(
     *,
     file_bytes: bytes,
