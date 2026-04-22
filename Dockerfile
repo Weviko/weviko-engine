@@ -5,9 +5,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
-RUN adduser --disabled-password --gecos "" pwuser && \
+RUN if ! id -u pwuser >/dev/null 2>&1; then \
+        adduser --disabled-password --gecos "" pwuser; \
+    fi && \
     mkdir -p /home/pwuser/app && \
-    chown -R pwuser:pwuser /home/pwuser
+    chown -R pwuser:pwuser /home/pwuser/app
 
 WORKDIR /home/pwuser/app
 
