@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -351,6 +352,154 @@ def _parse_json_text(raw_text: str) -> dict[str, Any]:
     return {"raw_response": loaded}
 
 
+def _extract_vehicle_identifier_examples(raw_text: str) -> dict[str, list[str]]:
+    text = raw_text or ""
+    upper_text = text.upper()
+    vin_examples = sorted(set(re.findall(r"\b[A-HJ-NPR-Z0-9]{17}\b", upper_text)))
+    engine_code_examples = sorted(
+        set(
+            match
+            for match in re.findall(r"\b[A-Z0-9-]{4,12}\b", upper_text)
+            if any(char.isdigit() for char in match) and any(char.isalpha() for char in match)
+        )
+    )
+    return {
+        "vin_examples": vin_examples[:10],
+        "engine_or_code_examples": engine_code_examples[:20],
+    }
+
+
+def assess_analysis_quality(payload: dict[str, Any]) -> dict[str, Any]:
+    schema_key = str(payload.get("schema_key", "") or "")
+    part_number = str(payload.get("part_number", "") or "").strip()
+    raw_response = payload.get("raw_response")
+    extracted_facts = payload.get("extracted_facts")
+    summary = str(payload.get("summary", "") or "").strip()
+
+    reasons: list[str] = []
+    if raw_response:
+        reasons.append("raw_response_only")
+    if not isinstance(extracted_facts, dict) or not extracted_facts:
+        reasons.append("empty_extracted_facts")
+    if not summary:
+        reasons.append("missing_summary")
+    if schema_key != "path_vehicle_id" and part_number in {"", "Unknown", "UNKNOWN_PART", "AI_AUTO_DETECT"}:
+        reasons.append("placeholder_part_number")
+
+    quality_status = "low" if raw_response or len(reasons) >= 2 else "ok"
+    payload["quality_status"] = quality_status
+    payload["quality_reasons"] = reasons
+    payload["needs_refinement"] = quality_status == "low"
+    return payload
+
+
+def refine_vision_result_and_save(
+    analysis_payload: dict[str, Any],
+    *,
+    schema_key: str,
+    market: str,
+    source_path_hint: str = "",
+    document_type: str = "",
+    part_number_hint: str = "",
+    oem_brand: str = "",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    llm = get_cached_llm()
+    if llm is None:
+        return analysis_payload, {"saved": False, "message": "Gemini가 설정되지 않아 재구조화를 진행할 수 없습니다."}
+
+    raw_source = str(
+        analysis_payload.get("raw_response")
+        or analysis_payload.get("summary")
+        or json.dumps(analysis_payload, ensure_ascii=False, indent=2)
+    ).strip()
+    if not raw_source:
+        return analysis_payload, {"saved": False, "message": "재구조화할 원본 설명문이 없습니다."}
+
+    refinement_prompt = (
+        f"{get_system_prompt(schema_key, '자동차 자료를 구조화 JSON으로 변환하세요.')}\n\n"
+        "반드시 순수 JSON 객체만 반환하세요.\n"
+        "설명문, 마크다운, 코드블록을 넣지 마세요.\n"
+        "부품 문서가 아니면 `part_number`는 `UNKNOWN`으로 두고, 문서 성격을 `document_type`과 `summary`에 명확히 적으세요.\n"
+        "설명 위주의 긴 문장을 그대로 넣지 말고, 핵심 사실만 필드로 정리하세요.\n"
+        "가능하면 `summary`, `extracted_facts`, `cautions`를 포함하세요.\n"
+    )
+
+    if schema_key == "path_vehicle_id":
+        refinement_prompt += (
+            "이 자료는 차량 식별/VIN/페인트 코드/엔진 코드 해설 자료일 수 있습니다.\n"
+            "`vehicle_identifier_facts` 아래에 `vin_examples`, `paint_code_examples`, `engine_or_code_examples`, "
+            "`serial_or_label_examples` 같은 키를 사용해 정리하세요.\n"
+            "정비 절차나 토크 문서로 오인하지 마세요.\n"
+        )
+
+    message = HumanMessage(
+        content=[
+            {"type": "text", "text": refinement_prompt},
+            {"type": "text", "text": f"[원본 설명문]\n{raw_source}"},
+        ]
+    )
+
+    try:
+        response = invoke_llm_with_fallback([message])
+        refined_payload = _parse_json_text(_extract_response_text(getattr(response, "content", response)))
+    except Exception as exc:
+        return analysis_payload, {"saved": False, "message": f"재구조화 중 Gemini 호출 실패: {exc}"}
+
+    if schema_key == "path_vehicle_id":
+        examples = _extract_vehicle_identifier_examples(raw_source)
+        if examples["vin_examples"] or examples["engine_or_code_examples"]:
+            vehicle_identifier_facts = refined_payload.setdefault("vehicle_identifier_facts", {})
+            for key, values in examples.items():
+                if values and key not in vehicle_identifier_facts:
+                    vehicle_identifier_facts[key] = values
+
+    refined_payload.setdefault(
+        "part_number",
+        "UNKNOWN" if schema_key == "path_vehicle_id" else (part_number_hint or "Unknown"),
+    )
+    refined_payload.setdefault("oem_brand", oem_brand)
+    refined_payload.setdefault("schema_key", schema_key)
+    refined_payload.setdefault("source_path_hint", source_path_hint)
+    refined_payload.setdefault("document_type", document_type or schema_key)
+    refined_payload.setdefault("market", market)
+    refined_payload["analysis_mode"] = "gemini_refined"
+    refined_payload["captured_at"] = datetime.now().isoformat(timespec="seconds")
+    assess_analysis_quality(refined_payload)
+
+    _insert_remote(
+        vision_table_name(),
+        {
+            "part_number": refined_payload.get("part_number", part_number_hint or "Unknown"),
+            "oem_brand": refined_payload.get("oem_brand", oem_brand),
+            "schema_key": refined_payload.get("schema_key", schema_key),
+            "source_path_hint": refined_payload.get("source_path_hint", source_path_hint),
+            "document_type": refined_payload.get("document_type", document_type or "Unknown"),
+            "analysis": refined_payload,
+            "created_at": _utc_now_iso(),
+        },
+    )
+
+    pending_payload = {
+        "part_number": refined_payload.get("part_number", part_number_hint or "Unknown"),
+        "oem_brand": refined_payload.get("oem_brand", oem_brand),
+        "schema_key": refined_payload.get("schema_key", schema_key),
+        "source_path_hint": refined_payload.get("source_path_hint", source_path_hint),
+        "market": market,
+        "document_type": refined_payload.get("document_type", document_type),
+        "source_type": "vision_refined",
+        "raw_json": refined_payload,
+        "status": "pending",
+        "created_at": _utc_now_iso(),
+    }
+    saved, message = _insert_remote(pending_table_name(), pending_payload)
+    return refined_payload, {
+        "saved": saved,
+        "message": message,
+        "prompt_key": schema_key,
+        "destination": "Pending",
+    }
+
+
 def process_vision_and_save(
     file_bytes: bytes,
     file_type: str | None,
@@ -418,6 +567,15 @@ def process_vision_and_save(
                 "analysis_mode": "error_fallback",
                 "captured_at": datetime.now().isoformat(timespec="seconds"),
             }
+
+    if doc_type_key == "path_vehicle_id" and str(payload.get("part_number", "")).strip() in {
+        "",
+        "Unknown",
+        "UNKNOWN_PART",
+        "AI_AUTO_DETECT",
+    }:
+        payload["part_number"] = "UNKNOWN"
+    assess_analysis_quality(payload)
 
     _insert_remote(
         vision_table_name(),

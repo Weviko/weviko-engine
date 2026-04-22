@@ -12,6 +12,7 @@ from weviko_factory import run_factory
 
 from streamlit_services import (
     approve_pending_item,
+    assess_analysis_quality,
     fetch_dead_letters,
     fetch_parts_count,
     fetch_parts_export,
@@ -24,6 +25,7 @@ from streamlit_services import (
     process_scraped_text_and_save,
     process_vision_and_save,
     reject_pending_item,
+    refine_vision_result_and_save,
     save_config_prompt,
     save_part_translation,
     supabase_available,
@@ -47,6 +49,7 @@ VISION_DOC_TYPE_OPTIONS = {
     "정비 지침/토크": {"schema_key": "path_manual", "path_hint": "/shop/manual/"},
     "회로도/배선도": {"schema_key": "path_wiring", "path_hint": "/contents/etc/"},
     "부품 제원/도해도": {"schema_key": "path_detail", "path_hint": "/item/detail/"},
+    "차량 식별/VIN/페인트 코드": {"schema_key": "path_vehicle_id", "path_hint": "/vehicle-id/"},
     "고장 코드 DTC": {"schema_key": "path_dtc", "path_hint": "/dtc/"},
 }
 
@@ -74,6 +77,11 @@ DEFAULT_PROMPTS = {
     ),
     "path_detail": (
         "부품 제원/호환성 페이지입니다. 부품번호, 규격, OEM 정보, 적용 차종, 연식, 호환 조건을 우선 추출하세요."
+    ),
+    "path_vehicle_id": (
+        "차량 식별/VIN/페인트 코드/엔진 코드 해설 자료입니다. "
+        "부품번호를 억지로 만들지 말고, VIN 예시, 차대번호 규칙, 페인트 코드, 엔진/변속기 코드, "
+        "시리얼/라벨 구조 같은 차량 식별 팩트만 JSON으로 정리하세요."
     ),
     "path_wiring": (
         "회로도/배선도 자료입니다. 커넥터, 핀, 회로명, 전압/저항 등 계측 가능한 사실만 구조화하세요."
@@ -121,6 +129,8 @@ def init_state() -> None:
         st.session_state["prompt_source"] = "defaults"
     if "last_vision_result" not in st.session_state:
         st.session_state["last_vision_result"] = None
+    if "last_vision_context" not in st.session_state:
+        st.session_state["last_vision_context"] = None
     if "last_translation_results" not in st.session_state:
         st.session_state["last_translation_results"] = {}
     if "last_factory_result" not in st.session_state:
@@ -371,11 +381,22 @@ def render_vision_input_mode() -> None:
                 prompt_override=f"{prompt_value(schema_key)}\n\n" + "\n".join(context_lines),
             )
 
+        analysis_result = assess_analysis_quality(analysis_result)
         st.session_state["last_vision_result"] = analysis_result
+        st.session_state["last_vision_context"] = {
+            "identifier": identifier,
+            "schema_key": schema_key,
+            "path_hint": path_hint,
+            "market": market,
+            "document_type": selected_type,
+        }
 
         analysis_mode = analysis_result.get("analysis_mode", "")
-        if analysis_mode == "gemini" and queue_result["saved"]:
+        quality_status = analysis_result.get("quality_status", "ok")
+        if analysis_mode == "gemini" and queue_result["saved"] and quality_status == "ok":
             st.success("✅ 데이터 추출 성공! '검수 대기열'로 이동했습니다.")
+        elif queue_result["saved"] and quality_status == "low":
+            st.warning("⚠️ 저장은 완료됐지만, 이번 결과는 구조화 정확도가 낮아서 재정리가 필요할 수 있습니다.")
         elif queue_result["saved"]:
             st.warning("⚠️ 대기열 저장은 완료됐지만, Gemini 응답에 문제가 있어 오류 대체 JSON으로 저장됐습니다.")
         else:
@@ -387,8 +408,40 @@ def render_vision_input_mode() -> None:
             st.json(analysis_result)
 
     if st.session_state.get("last_vision_result") is not None:
+        last_result = assess_analysis_quality(dict(st.session_state["last_vision_result"]))
+        st.session_state["last_vision_result"] = last_result
         st.subheader("최근 Vision 분석 결과")
-        st.json(st.session_state["last_vision_result"])
+        st.json(last_result)
+
+        if last_result.get("quality_status") == "low":
+            reasons = ", ".join(last_result.get("quality_reasons", [])) or "low_quality"
+            st.warning(
+                "현재 결과는 구조화 정확도가 낮은 편입니다. "
+                f"감지 사유: `{reasons}`"
+            )
+
+            raw_hint_text = str(last_result.get("raw_response", "")).lower()
+            if any(keyword in raw_hint_text for keyword in ["vin", "차대번호", "paint code", "페인트 코드"]):
+                st.info("이 문서는 정비 지침서보다 `차량 식별/VIN/페인트 코드` 스키마에 더 가까워 보입니다. 해당 스키마로 다시 분석하면 품질이 좋아질 가능성이 큽니다.")
+
+            context = st.session_state.get("last_vision_context") or {}
+            if st.button("🧪 원문 설명을 구조화 JSON으로 재정리", use_container_width=True):
+                with st.spinner("원문 설명을 구조화 JSON으로 다시 정리하고 있습니다..."):
+                    refined_result, refine_save_result = refine_vision_result_and_save(
+                        last_result,
+                        schema_key=context.get("schema_key", last_result.get("schema_key", "path_manual")),
+                        market=context.get("market", last_result.get("market", "GLOBAL")),
+                        source_path_hint=context.get("path_hint", last_result.get("source_path_hint", "")),
+                        document_type=context.get("document_type", last_result.get("document_type", "")),
+                        part_number_hint=context.get("identifier", last_result.get("part_number", "")),
+                        oem_brand=last_result.get("oem_brand", ""),
+                    )
+                st.session_state["last_vision_result"] = refined_result
+                if refine_save_result.get("saved"):
+                    st.success("✅ 재정리된 JSON을 새 검수 대기 항목으로 저장했습니다.")
+                else:
+                    st.warning(refine_save_result.get("message", "재정리 결과 저장에 실패했습니다."))
+                st.rerun()
 
 
 def render_factory_mode() -> None:
@@ -694,6 +747,7 @@ def render_settings_mode() -> None:
             [
                 "path_manual",
                 "path_detail",
+                "path_vehicle_id",
                 "path_wiring",
                 "path_dtc",
                 "path_community",
