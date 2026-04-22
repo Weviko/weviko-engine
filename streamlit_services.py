@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
-from main import build_llm, build_supabase_client
+from main import build_llm, build_supabase_client, invoke_llm_with_fallback
 
 
 load_dotenv()
@@ -392,17 +392,32 @@ def process_vision_and_save(
                 {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{file_b64}"}},
             ]
         )
-        response = llm.invoke([msg])
-        raw_text = _extract_response_text(getattr(response, "content", response))
-        payload = _parse_json_text(raw_text)
-        payload.setdefault("part_number", part_num or "Unknown")
-        payload.setdefault("oem_brand", oem_brand)
-        payload.setdefault("schema_key", doc_type_key)
-        payload.setdefault("source_path_hint", source_path_hint)
-        payload.setdefault("document_type", document_type)
-        payload.setdefault("market", market)
-        payload["analysis_mode"] = "gemini"
-        payload["captured_at"] = datetime.now().isoformat(timespec="seconds")
+        try:
+            response = invoke_llm_with_fallback([msg])
+            raw_text = _extract_response_text(getattr(response, "content", response))
+            payload = _parse_json_text(raw_text)
+            payload.setdefault("part_number", part_num or "Unknown")
+            payload.setdefault("oem_brand", oem_brand)
+            payload.setdefault("schema_key", doc_type_key)
+            payload.setdefault("source_path_hint", source_path_hint)
+            payload.setdefault("document_type", document_type)
+            payload.setdefault("market", market)
+            payload["analysis_mode"] = "gemini"
+            payload["captured_at"] = datetime.now().isoformat(timespec="seconds")
+        except Exception as exc:
+            payload = {
+                "part_number": part_num or "Unknown",
+                "oem_brand": oem_brand,
+                "schema_key": doc_type_key,
+                "source_path_hint": source_path_hint,
+                "document_type": document_type,
+                "market": market,
+                "summary": "Gemini 호출 중 오류가 발생해 안전한 오류 응답으로 대체했습니다.",
+                "extracted_facts": {"inspection_required": True},
+                "cautions": [f"Gemini invocation failed: {exc}"],
+                "analysis_mode": "error_fallback",
+                "captured_at": datetime.now().isoformat(timespec="seconds"),
+            }
 
     _insert_remote(
         vision_table_name(),
@@ -467,14 +482,17 @@ def process_scraped_text_and_save(
         ]
     )
 
-    response = llm.invoke([msg])
-    raw_text = _extract_response_text(getattr(response, "content", response))
-    payload = _parse_json_text(raw_text)
-    payload.setdefault("part_number", part_number_hint or "UNKNOWN_PART")
-    payload.setdefault("source_path_hint", source_path_hint)
-    payload.setdefault("schema_key", doc_type_key)
-    payload.setdefault("market", market)
-    payload["scraped_at"] = datetime.now().isoformat(timespec="seconds")
+    try:
+        response = invoke_llm_with_fallback([msg])
+        raw_text = _extract_response_text(getattr(response, "content", response))
+        payload = _parse_json_text(raw_text)
+        payload.setdefault("part_number", part_number_hint or "UNKNOWN_PART")
+        payload.setdefault("source_path_hint", source_path_hint)
+        payload.setdefault("schema_key", doc_type_key)
+        payload.setdefault("market", market)
+        payload["scraped_at"] = datetime.now().isoformat(timespec="seconds")
+    except Exception as exc:
+        return {}, {"saved": False, "message": f"Gemini 분석 실패: {exc}"}
 
     temp_part_number = str(payload.get("part_number") or part_number_hint or "UNKNOWN_PART").strip()
 
@@ -542,7 +560,6 @@ def analyze_uploaded_image(
         }
         return fallback, {"saved": False, "message": "Gemini 미설정 상태입니다."}
 
-    structured_llm = llm.with_structured_output(VisionFactBundle)
     image_data = base64.b64encode(file_bytes).decode("utf-8")
     instruction = (
         f"{prompt_text}\n\n"
@@ -563,8 +580,23 @@ def analyze_uploaded_image(
             },
         ]
     )
-    result = structured_llm.invoke([message])
-    payload = result.model_dump()
+    try:
+        result = invoke_llm_with_fallback([message], structured_schema=VisionFactBundle)
+        payload = result.model_dump()
+    except Exception as exc:
+        fallback = {
+            "part_number": part_number or "Unknown",
+            "oem_brand": oem_brand,
+            "schema_key": schema_key,
+            "source_path_hint": source_path_hint,
+            "document_type": document_type,
+            "summary": "Gemini Vision 호출 중 오류가 발생해 안전한 오류 응답으로 대체했습니다.",
+            "extracted_facts": {"inspection_required": True},
+            "cautions": [f"Gemini invocation failed: {exc}"],
+            "captured_at": datetime.now().isoformat(timespec="seconds"),
+            "analysis_mode": "error_fallback",
+        }
+        return fallback, {"saved": False, "message": f"Gemini Vision 호출 실패: {exc}"}
     if part_number and payload.get("part_number", "Unknown") in {"", "Unknown"}:
         payload["part_number"] = part_number
     if oem_brand and not payload.get("oem_brand"):
@@ -656,17 +688,28 @@ def translate_record(
         }
         return fallback, {"saved": False, "message": "Gemini 미설정 상태입니다."}
 
-    structured_llm = llm.with_structured_output(TranslationBundle)
     instruction = (
         f"{prompt_text}\n\n"
         "Translate the structured automotive payload into Korean, English, and Vietnamese. "
         "Preserve part numbers, numbers, units, torque ranges, and codes exactly. "
         "Return compact JSON objects for each target language."
     )
-    result = structured_llm.invoke(
-        f"{instruction}\n\n[Source JSON]\n{json.dumps(source_payload, ensure_ascii=False, indent=2)}"
-    )
-    payload = result.model_dump()
+    try:
+        result = invoke_llm_with_fallback(
+            f"{instruction}\n\n[Source JSON]\n{json.dumps(source_payload, ensure_ascii=False, indent=2)}",
+            structured_schema=TranslationBundle,
+        )
+        payload = result.model_dump()
+    except Exception as exc:
+        fallback = {
+            "ko": source_payload,
+            "en": source_payload,
+            "vn": source_payload,
+            "notes": f"Gemini 번역 호출 실패로 원본 구조를 반환했습니다: {exc}",
+            "translated_at": datetime.now().isoformat(timespec="seconds"),
+            "translation_mode": "error_fallback",
+        }
+        return fallback, {"saved": False, "message": f"Gemini 번역 호출 실패: {exc}"}
     payload["translated_at"] = datetime.now().isoformat(timespec="seconds")
     payload["translation_mode"] = "gemini"
 

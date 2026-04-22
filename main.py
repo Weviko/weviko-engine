@@ -37,6 +37,18 @@ if TYPE_CHECKING:
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_FALLBACK_MODELS = (
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+)
+LEGACY_GEMINI_MODEL_ALIASES = {
+    "gemini-1.5-pro": DEFAULT_GEMINI_MODEL,
+    "gemini-1.5-pro-latest": DEFAULT_GEMINI_MODEL,
+    "gemini-pro": DEFAULT_GEMINI_MODEL,
+}
+
 
 class FactData(BaseModel):
     part_number: str = Field(default="Unknown")
@@ -159,7 +171,37 @@ def build_supabase_client():
     return create_client(supabase_url, supabase_key)
 
 
-def build_llm():
+def normalize_gemini_model_name(model_name: str | None) -> str:
+    raw_value = (model_name or "").strip()
+    if raw_value.startswith("models/"):
+        raw_value = raw_value.split("/", 1)[1].strip()
+    legacy_target = LEGACY_GEMINI_MODEL_ALIASES.get(raw_value.lower())
+    if legacy_target:
+        return legacy_target
+    return raw_value or DEFAULT_GEMINI_MODEL
+
+
+def gemini_candidate_models(preferred_model: str | None = None) -> list[str]:
+    candidates: list[str] = []
+    primary_model = normalize_gemini_model_name(
+        preferred_model or os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+    )
+    for raw_name in [primary_model, *env_csv_list("GEMINI_FALLBACK_MODELS", DEFAULT_GEMINI_FALLBACK_MODELS)]:
+        normalized = normalize_gemini_model_name(raw_name)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+    return candidates
+
+
+def is_gemini_model_not_found_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        ("not found" in text or "not_found" in text)
+        and ("model" in text or "models/" in text)
+    )
+
+
+def build_llm(model_name: str | None = None):
     if ChatGoogleGenerativeAI is None:
         print("[Setup] `langchain-google-genai` is not installed. AI extraction is disabled.")
         return None
@@ -173,10 +215,36 @@ def build_llm():
         return None
 
     return ChatGoogleGenerativeAI(
-        model=os.getenv("GEMINI_MODEL", "gemini-1.5-pro"),
+        model=normalize_gemini_model_name(model_name or os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)),
         temperature=0,
         google_api_key=google_api_key,
     )
+
+
+def invoke_llm_with_fallback(
+    payload: Any,
+    *,
+    structured_schema: type[BaseModel] | None = None,
+):
+    last_error: Exception | None = None
+    for model_name in gemini_candidate_models():
+        llm = build_llm(model_name)
+        if llm is None:
+            return None
+
+        target = llm.with_structured_output(structured_schema) if structured_schema is not None else llm
+        try:
+            return target.invoke(payload)
+        except Exception as exc:
+            if is_gemini_model_not_found_error(exc):
+                logger.warning("[Gemini] model `%s` is not available. Trying next fallback.", model_name)
+                last_error = exc
+                continue
+            raise
+
+    if last_error is not None:
+        raise last_error
+    return None
 
 
 class WevikoSpider:
@@ -784,11 +852,16 @@ class WevikoBrain:
             "Extract the automotive part number and any measurable facts from the compressed body below. "
             "Return data that matches the provided structured schema."
         )
-        llm_with_schema = self.llm.with_structured_output(FactData)
         result = await asyncio.to_thread(
-            llm_with_schema.invoke,
+            invoke_llm_with_fallback,
             f"{prompt}\n\n[Compressed Body]\n{compressed_markdown}",
+            structured_schema=FactData,
         )
+        if result is None:
+            row["status"] = "Model Unavailable"
+            print(f"[AI] no supported Gemini model is available right now: {url}")
+            self._persist_result(url, content_hash, None)
+            return None
 
         row["status"] = "AI Extracted"
         row["part_number"] = result.part_number

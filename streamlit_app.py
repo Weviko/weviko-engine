@@ -373,8 +373,11 @@ def render_vision_input_mode() -> None:
 
         st.session_state["last_vision_result"] = analysis_result
 
-        if queue_result["saved"]:
+        analysis_mode = analysis_result.get("analysis_mode", "")
+        if analysis_mode == "gemini" and queue_result["saved"]:
             st.success("✅ 데이터 추출 성공! '검수 대기열'로 이동했습니다.")
+        elif queue_result["saved"]:
+            st.warning("⚠️ 대기열 저장은 완료됐지만, Gemini 응답에 문제가 있어 오류 대체 JSON으로 저장됐습니다.")
         else:
             st.warning("분석은 완료됐지만 검수 대기열 저장은 되지 않았습니다.")
 
