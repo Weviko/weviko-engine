@@ -714,26 +714,40 @@ def persist_review_decision(
             parts_message = "Supabase가 설정되지 않아 parts 테이블 반영을 건너뜁니다."
         else:
             try:
+                resolved_part_number = (
+                    reviewed_record.get("part_number")
+                    or original_record.get("part_number")
+                    or "Unknown"
+                )
+                resolved_oem_brand = reviewed_record.get("oem_brand") or original_record.get("oem_brand", "")
+                resolved_schema_key = reviewed_record.get("schema_key") or original_record.get("schema_key", "")
+                resolved_source_path_hint = (
+                    reviewed_record.get("source_path_hint")
+                    or original_record.get("source_path_hint", "")
+                )
+                resolved_market = reviewed_record.get("market") or original_record.get("market", "GLOBAL")
+                resolved_document_type = (
+                    reviewed_record.get("document_type")
+                    or original_record.get("document_type", "")
+                )
+                resolved_source_type = (
+                    reviewed_record.get("source_type")
+                    or original_record.get("source_type", "")
+                )
+
                 client.table(parts_table_name()).upsert(
                     {
-                        "url": reviewed_record.get("url") or original_record.get("url", ""),
-                        "part_number": reviewed_record.get("part_number")
-                        or original_record.get("part_number")
-                        or "Unknown",
-                        "oem_brand": reviewed_record.get("oem_brand")
-                        or original_record.get("oem_brand", ""),
-                        "schema_key": reviewed_record.get("schema_key")
-                        or original_record.get("schema_key", ""),
-                        "source_path_hint": reviewed_record.get("source_path_hint")
-                        or original_record.get("source_path_hint", ""),
-                        "extracted_facts": reviewed_record.get("extracted_facts")
-                        or original_record.get("extracted_facts")
-                        or {},
-                        "content_hash": reviewed_record.get("content_hash")
-                        or original_record.get("content_hash", ""),
+                        "part_number": resolved_part_number,
+                        "oem_brand": resolved_oem_brand,
+                        "schema_key": resolved_schema_key,
+                        "source_path_hint": resolved_source_path_hint,
+                        "market": resolved_market,
+                        "document_type": resolved_document_type,
+                        "source_type": resolved_source_type,
+                        "spec_data": reviewed_record or original_record,
                         "updated_at": _utc_now_iso(),
                     },
-                    on_conflict="url",
+                    on_conflict="part_number",
                 ).execute()
                 upserted_parts = True
                 parts_message = "parts 테이블에 승인 데이터를 반영했습니다."
