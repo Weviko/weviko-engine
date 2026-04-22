@@ -22,6 +22,7 @@ class VisionFactBundle(BaseModel):
     """Structured extraction result for uploaded automotive document images."""
 
     part_number: str = Field(default="Unknown", description="Detected automotive part number.")
+    oem_brand: str = Field(default="", description="OEM brand associated with the part.")
     document_type: str = Field(default="Unknown", description="Detected document type.")
     summary: str = Field(default="", description="Short summary of the image contents.")
     extracted_facts: dict[str, Any] = Field(
@@ -310,6 +311,7 @@ def analyze_uploaded_image(
     file_bytes: bytes,
     mime_type: str,
     part_number: str,
+    oem_brand: str,
     document_type: str,
     prompt_text: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -317,6 +319,7 @@ def analyze_uploaded_image(
     if llm is None:
         fallback = {
             "part_number": part_number or "Unknown",
+            "oem_brand": oem_brand,
             "document_type": document_type,
             "summary": "Gemini가 설정되지 않아 예시 기반 Vision 결과를 반환했습니다.",
             "extracted_facts": {
@@ -334,8 +337,9 @@ def analyze_uploaded_image(
         f"{prompt_text}\n\n"
         f"Requested document type: {document_type}\n"
         f"User supplied part number: {part_number or 'Unknown'}\n"
+        f"User supplied OEM brand: {oem_brand or 'Unknown'}\n"
         "Return only structured automotive facts. Keep units and ranges exactly as shown. "
-        "If the user supplied part number is valid and the image is ambiguous, prefer the supplied number."
+        "If the user supplied part number or OEM brand is valid and the image is ambiguous, prefer the supplied values."
     )
     message = HumanMessage(
         content=[
@@ -350,6 +354,8 @@ def analyze_uploaded_image(
     payload = result.model_dump()
     if part_number and payload.get("part_number", "Unknown") in {"", "Unknown"}:
         payload["part_number"] = part_number
+    if oem_brand and not payload.get("oem_brand"):
+        payload["oem_brand"] = oem_brand
     payload["document_type"] = document_type or payload.get("document_type", "Unknown")
     payload["captured_at"] = datetime.now().isoformat(timespec="seconds")
     payload["analysis_mode"] = "gemini"
@@ -358,6 +364,7 @@ def analyze_uploaded_image(
         vision_table_name(),
         {
             "part_number": payload.get("part_number", "Unknown"),
+            "oem_brand": payload.get("oem_brand", ""),
             "document_type": payload.get("document_type", "Unknown"),
             "analysis": payload,
             "created_at": _utc_now_iso(),
@@ -369,6 +376,7 @@ def analyze_uploaded_image(
 def enqueue_pending_vision_result(
     *,
     part_number: str,
+    oem_brand: str,
     market: str,
     document_type: str,
     analysis_payload: dict[str, Any],
@@ -376,6 +384,7 @@ def enqueue_pending_vision_result(
 ) -> dict[str, Any]:
     payload = {
         "part_number": part_number or analysis_payload.get("part_number", "Unknown"),
+        "oem_brand": oem_brand or analysis_payload.get("oem_brand", ""),
         "market": market,
         "document_type": document_type,
         "source_type": source_type,
@@ -395,6 +404,7 @@ def _build_translation_source(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "url": record.get("url", ""),
         "part_number": record.get("part_number", ""),
+        "oem_brand": record.get("oem_brand", ""),
         "target_market": record.get("target_market", ""),
         "spec_data": record.get("spec_data") or record.get("extracted_facts", {}),
         "status": record.get("status", ""),
@@ -440,6 +450,7 @@ def translate_record(
         {
             "source_url": record.get("url", ""),
             "part_number": record.get("part_number", ""),
+            "oem_brand": record.get("oem_brand", ""),
             "translations": payload,
             "created_at": _utc_now_iso(),
         },
@@ -483,6 +494,7 @@ def approve_pending_item(
         client.table(parts_table_name()).upsert(
             {
                 "part_number": item.get("part_number") or edited_payload.get("part_number", "Unknown"),
+                "oem_brand": item.get("oem_brand") or edited_payload.get("oem_brand", ""),
                 "market": item.get("market", "GLOBAL"),
                 "document_type": item.get("document_type", ""),
                 "source_type": item.get("source_type", ""),
@@ -632,6 +644,7 @@ def persist_review_decision(
         "source_url": original_record.get("url", ""),
         "final_url": reviewed_record.get("final_url") or original_record.get("final_url", ""),
         "part_number": reviewed_record.get("part_number") or original_record.get("part_number") or "Unknown",
+        "oem_brand": reviewed_record.get("oem_brand") or original_record.get("oem_brand", ""),
         "decision": decision,
         "notes": notes,
         "review_payload": reviewed_record,
@@ -654,6 +667,8 @@ def persist_review_decision(
                         "part_number": reviewed_record.get("part_number")
                         or original_record.get("part_number")
                         or "Unknown",
+                        "oem_brand": reviewed_record.get("oem_brand")
+                        or original_record.get("oem_brand", ""),
                         "extracted_facts": reviewed_record.get("extracted_facts")
                         or original_record.get("extracted_facts")
                         or {},

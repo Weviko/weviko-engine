@@ -240,12 +240,13 @@ def render_sidebar() -> str:
 
 def render_vision_input_mode() -> None:
     st.title("📷 수동 캡처 (GSW 우회 입력)")
-    st.info("이미지를 업로드하면 AI가 분석하고 `pending_data` 검수 대기열로 전송합니다.")
+    st.info("이미지를 업로드하면 AI가 분석하고 OEM 브랜드 정보와 함께 `pending_data` 검수 대기열로 전송합니다.")
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     part_number = col1.text_input("부품 번호 (필수)")
-    document_type = col2.selectbox("문서 종류", ["정비 지침", "도해도/스펙", "회로도"])
-    market = col3.selectbox("시장", ["GLOBAL", "VN", "KR", "US"])
+    oem_brand = col2.text_input("OEM 브랜드", placeholder="HYUNDAI / KIA / MOBIS")
+    document_type = col3.selectbox("문서 종류", ["정비 지침", "도해도/스펙", "회로도"])
+    market = col4.selectbox("시장", ["GLOBAL", "VN", "KR", "US"])
 
     prompt_text = st.text_area(
         "Vision 프롬프트",
@@ -267,11 +268,13 @@ def render_vision_input_mode() -> None:
                 file_bytes=uploaded_file.getvalue(),
                 mime_type=uploaded_file.type or "image/png",
                 part_number=part_number.strip(),
+                oem_brand=oem_brand.strip(),
                 document_type=document_type,
                 prompt_text=prompt_text,
             )
             queue_result = enqueue_pending_vision_result(
                 part_number=part_number.strip(),
+                oem_brand=oem_brand.strip(),
                 market=market,
                 document_type=document_type,
                 analysis_payload=analysis_result,
@@ -304,14 +307,23 @@ def render_review_mode() -> None:
         return
 
     item_lookup = {
-        f"{item.get('part_number', 'Unknown')} | {item.get('market', 'GLOBAL')} | {item.get('source_type', 'unknown')}": item
+        (
+            f"{item.get('part_number', 'Unknown')} | "
+            f"{item.get('oem_brand', '-') or '-'} | "
+            f"{item.get('market', 'GLOBAL')} | "
+            f"{item.get('source_type', 'unknown')}"
+        ): item
         for item in pending_items
     }
     selected_label = st.selectbox("검수 대상", list(item_lookup.keys()))
     item = item_lookup[selected_label]
 
     st.write(f"### 부품 번호: `{item.get('part_number', 'Unknown')}`")
-    st.caption(f"시장: {item.get('market', 'GLOBAL')} | 문서 종류: {item.get('document_type', '-')}")
+    st.caption(
+        f"OEM 브랜드: {item.get('oem_brand', '-') or '-'} | "
+        f"시장: {item.get('market', 'GLOBAL')} | "
+        f"문서 종류: {item.get('document_type', '-')}"
+    )
 
     raw_json = item.get("raw_json", {})
     edited_json = st.text_area(
@@ -372,7 +384,8 @@ def render_translation_mode() -> None:
         progress = st.progress(0, text="번역 준비 중...")
         for index, row in enumerate(parts_rows, start=1):
             part_number = row.get("part_number", "Unknown")
-            st.write(f"번역 중: {part_number}")
+            oem_brand = row.get("oem_brand", "") or "-"
+            st.write(f"번역 중: {part_number} ({oem_brand})")
             translation_payload, translation_status = translate_record(
                 record=row,
                 prompt_text=prompt_text,

@@ -6,6 +6,7 @@ create extension if not exists pgcrypto;
 -- 1. Formal parts repository
 create table if not exists public.parts (
   part_number text primary key,
+  oem_brand text,
   market text,
   document_type text,
   source_type text,
@@ -15,13 +16,24 @@ create table if not exists public.parts (
   updated_at timestamptz not null default now()
 );
 
+alter table public.parts add column if not exists oem_brand text;
+alter table public.parts add column if not exists market text;
+alter table public.parts add column if not exists document_type text;
+alter table public.parts add column if not exists source_type text;
+alter table public.parts add column if not exists spec_data jsonb not null default '{}'::jsonb;
+alter table public.parts add column if not exists translations jsonb;
+alter table public.parts add column if not exists created_at timestamptz not null default now();
+alter table public.parts add column if not exists updated_at timestamptz not null default now();
+
 create index if not exists idx_parts_market on public.parts (market);
+create index if not exists idx_parts_oem_brand on public.parts (oem_brand);
 create index if not exists idx_parts_created_at on public.parts (created_at desc);
 
 -- 2. Pending review queue
 create table if not exists public.pending_data (
   id uuid primary key default gen_random_uuid(),
   part_number text,
+  oem_brand text,
   market text,
   document_type text,
   source_type text,
@@ -32,7 +44,19 @@ create table if not exists public.pending_data (
   rejected_at timestamptz
 );
 
+alter table public.pending_data add column if not exists part_number text;
+alter table public.pending_data add column if not exists oem_brand text;
+alter table public.pending_data add column if not exists market text;
+alter table public.pending_data add column if not exists document_type text;
+alter table public.pending_data add column if not exists source_type text;
+alter table public.pending_data add column if not exists raw_json jsonb not null default '{}'::jsonb;
+alter table public.pending_data add column if not exists status text not null default 'pending';
+alter table public.pending_data add column if not exists created_at timestamptz not null default now();
+alter table public.pending_data add column if not exists approved_at timestamptz;
+alter table public.pending_data add column if not exists rejected_at timestamptz;
+
 create index if not exists idx_pending_data_status on public.pending_data (status);
+create index if not exists idx_pending_data_oem_brand on public.pending_data (oem_brand);
 create index if not exists idx_pending_data_created_at on public.pending_data (created_at desc);
 
 -- 3. Prompt/config store
