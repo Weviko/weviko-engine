@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import hashlib
 import io
+import logging
 import os
 import re
 from collections import deque
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
 
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 
 class FactData(BaseModel):
@@ -529,6 +531,80 @@ class WevikoWorker:
         return compressed_markdown[: self.compressed_chars]
 
 
+class WevikoCrawler:
+    def __init__(
+        self,
+        proxy_url: str | None = None,
+        *,
+        user_agent: str | None = None,
+        blocked_resource_types: set[str] | None = None,
+        headless: bool | None = None,
+    ):
+        self.proxy_url = proxy_url.strip() if proxy_url else None
+        self.user_agent = user_agent or (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+        self.blocked_resource_types = set(
+            blocked_resource_types or {"image", "media", "font", "stylesheet"}
+        )
+        self.headless = env_flag("WEVIKO_HEADLESS", True) if headless is None else headless
+
+    async def _intercept_route(self, route) -> None:
+        if route.request.resource_type in self.blocked_resource_types:
+            await route.abort()
+            return
+        await route.continue_()
+
+    def _compress_html(self, raw_html: str) -> str:
+        soup = BeautifulSoup(raw_html, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+        return soup.get_text(separator="\n", strip=True)
+
+    async def scrape_target(self, url: str) -> str | None:
+        try:
+            from playwright.async_api import async_playwright
+            from playwright_stealth import Stealth
+        except ImportError as exc:
+            logger.error("Playwright import failed: %s", exc)
+            return None
+
+        browser_kwargs: dict[str, Any] = {"headless": self.headless}
+        if self.proxy_url:
+            browser_kwargs["proxy"] = {"server": self.proxy_url}
+        else:
+            proxy_config = build_proxy_config()
+            if proxy_config is not None:
+                browser_kwargs["proxy"] = proxy_config
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(**browser_kwargs)
+            try:
+                context = await browser.new_context(user_agent=self.user_agent, locale="en-US")
+                page = await context.new_page()
+                await Stealth().apply_stealth_async(page)
+                await page.route("**/*", self._intercept_route)
+
+                logger.info("접속 시도: %s", url)
+                try:
+                    response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    await page.wait_for_timeout(2000)
+                    raw_html = await page.content()
+                    clean_text = self._compress_html(raw_html)
+                    status_code = response.status if response is not None else "unknown"
+                    logger.info("수집 성공: 텍스트 길이 %s자 (status=%s)", len(clean_text), status_code)
+                    return clean_text
+                except Exception as exc:
+                    logger.error("수집 실패 (%s): %s", url, exc)
+                    return None
+                finally:
+                    await page.close()
+            finally:
+                await browser.close()
+
+
 class WevikoBrain:
     def __init__(
         self,
@@ -961,6 +1037,23 @@ def run_factory(
     capture.flush()
     result.log_lines = list(capture.lines)
     return result
+
+
+def run_crawler_sync(
+    url: str,
+    proxy: str | None = None,
+    *,
+    user_agent: str | None = None,
+    blocked_resource_types: set[str] | None = None,
+    headless: bool | None = None,
+) -> str | None:
+    crawler = WevikoCrawler(
+        proxy_url=proxy,
+        user_agent=user_agent,
+        blocked_resource_types=blocked_resource_types,
+        headless=headless,
+    )
+    return asyncio.run(crawler.scrape_target(url))
 
 
 async def main() -> None:
