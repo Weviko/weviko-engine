@@ -12,6 +12,8 @@ __pycache__/
 autoplatform/
 저장소이름/
 /[0-9A-Za-z_][0-9A-Za-z_][0-9A-Za-z_][0-9A-Za-z_][0-9A-Za-z_][0-9A-Za-z_][0-9A-Za-z_][0-9A-Za-z_]
+!supabase/
+!supabase/*.sql
 
 # Python / Streamlit caches
 .pytest_cache/
