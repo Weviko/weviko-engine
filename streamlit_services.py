@@ -172,7 +172,8 @@ def load_config_prompts(defaults: dict[str, str]) -> tuple[dict[str, str], str]:
             if prompt_key and prompt_value:
                 prompts[str(prompt_key)] = str(prompt_value)
                 source = "supabase"
-    except Exception:
+    except Exception as exc:
+        print(f"[Configs] prompt load failed. Falling back to local/default prompts: {exc}")
         pass
 
     return prompts, source
@@ -495,7 +496,8 @@ def fetch_pending_items(limit: int = 20) -> list[dict[str, Any]]:
             .execute()
         )
         return list(getattr(response, "data", []) or [])
-    except Exception:
+    except Exception as exc:
+        print(f"[Pending] fetch failed: {exc}")
         return []
 
 
@@ -513,15 +515,29 @@ def approve_pending_item(
         }
 
     try:
+        resolved_part_number = edited_payload.get("part_number") or item.get("part_number") or "Unknown"
+        resolved_oem_brand = edited_payload.get("oem_brand") or item.get("oem_brand", "")
+        resolved_schema_key = edited_payload.get("schema_key") or item.get("schema_key", "")
+        resolved_source_path_hint = (
+            edited_payload.get("source_path_hint")
+            or item.get("source_path_hint", "")
+        )
+        resolved_market = edited_payload.get("market") or item.get("market", "GLOBAL")
+        resolved_document_type = (
+            edited_payload.get("document_type")
+            or item.get("document_type", "")
+        )
+        resolved_source_type = edited_payload.get("source_type") or item.get("source_type", "")
+
         client.table(parts_table_name()).upsert(
             {
-                "part_number": item.get("part_number") or edited_payload.get("part_number", "Unknown"),
-                "oem_brand": item.get("oem_brand") or edited_payload.get("oem_brand", ""),
-                "schema_key": item.get("schema_key") or edited_payload.get("schema_key", ""),
-                "source_path_hint": item.get("source_path_hint") or edited_payload.get("source_path_hint", ""),
-                "market": item.get("market", "GLOBAL"),
-                "document_type": item.get("document_type", ""),
-                "source_type": item.get("source_type", ""),
+                "part_number": resolved_part_number,
+                "oem_brand": resolved_oem_brand,
+                "schema_key": resolved_schema_key,
+                "source_path_hint": resolved_source_path_hint,
+                "market": resolved_market,
+                "document_type": resolved_document_type,
+                "source_type": resolved_source_type,
                 "spec_data": edited_payload,
                 "updated_at": _utc_now_iso(),
             },
@@ -532,6 +548,13 @@ def approve_pending_item(
                 "status": "approved",
                 "approved_at": _utc_now_iso(),
                 "raw_json": edited_payload,
+                "part_number": resolved_part_number,
+                "oem_brand": resolved_oem_brand,
+                "schema_key": resolved_schema_key,
+                "source_path_hint": resolved_source_path_hint,
+                "market": resolved_market,
+                "document_type": resolved_document_type,
+                "source_type": resolved_source_type,
             }
         ).eq("id", item_id).execute()
         return {
@@ -585,7 +608,8 @@ def fetch_untranslated_parts(limit: int = 5) -> list[dict[str, Any]]:
             .execute()
         )
         return list(getattr(response, "data", []) or [])
-    except Exception:
+    except Exception as exc:
+        print(f"[Parts] untranslated fetch failed: {exc}")
         return []
 
 
@@ -629,7 +653,8 @@ def fetch_dead_letters(limit: int = 200) -> list[dict[str, Any]]:
             .execute()
         )
         return list(getattr(response, "data", []) or [])
-    except Exception:
+    except Exception as exc:
+        print(f"[DLQ] fetch failed: {exc}")
         return []
 
 
@@ -641,7 +666,8 @@ def fetch_parts_export() -> list[dict[str, Any]]:
     try:
         response = client.table(parts_table_name()).select("*").execute()
         return list(getattr(response, "data", []) or [])
-    except Exception:
+    except Exception as exc:
+        print(f"[Parts] export fetch failed: {exc}")
         return []
 
 
@@ -653,7 +679,8 @@ def fetch_parts_count() -> int:
     try:
         response = client.table(parts_table_name()).select("part_number", count="exact").execute()
         return int(getattr(response, "count", 0) or 0)
-    except Exception:
+    except Exception as exc:
+        print(f"[Parts] count fetch failed: {exc}")
         return 0
 
 

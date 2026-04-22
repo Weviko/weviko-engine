@@ -76,6 +76,61 @@ create table if not exists public.configs (
   updated_at timestamptz not null default now()
 );
 
+-- 3a. Legacy prompt store used by helper APIs
+create table if not exists public.system_prompts (
+  name text primary key,
+  prompt_text text not null,
+  updated_at timestamptz not null default now()
+);
+
+-- 3b. Review audit log
+create table if not exists public.review_decisions (
+  id uuid primary key default gen_random_uuid(),
+  source_url text,
+  final_url text,
+  part_number text,
+  oem_brand text,
+  schema_key text,
+  source_path_hint text,
+  decision text not null,
+  notes text,
+  review_payload jsonb not null default '{}'::jsonb,
+  reviewed_at timestamptz not null default now()
+);
+
+create index if not exists idx_review_decisions_part_number on public.review_decisions (part_number);
+create index if not exists idx_review_decisions_reviewed_at on public.review_decisions (reviewed_at desc);
+
+-- 3c. Vision extraction log
+create table if not exists public.vision_analysis (
+  id uuid primary key default gen_random_uuid(),
+  part_number text,
+  oem_brand text,
+  schema_key text,
+  source_path_hint text,
+  document_type text,
+  analysis jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_vision_analysis_part_number on public.vision_analysis (part_number);
+create index if not exists idx_vision_analysis_created_at on public.vision_analysis (created_at desc);
+
+-- 3d. Translation event log
+create table if not exists public.part_translations (
+  id uuid primary key default gen_random_uuid(),
+  source_url text,
+  part_number text,
+  oem_brand text,
+  schema_key text,
+  source_path_hint text,
+  translations jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_part_translations_part_number on public.part_translations (part_number);
+create index if not exists idx_part_translations_created_at on public.part_translations (created_at desc);
+
 -- 4. Crawl/dead-letter error store
 create table if not exists public.dead_letters (
   id uuid primary key default gen_random_uuid(),

@@ -356,7 +356,8 @@ def render_review_mode() -> None:
             f"{item.get('part_number', 'Unknown')} | "
             f"{item.get('oem_brand', '-') or '-'} | "
             f"{item.get('market', 'GLOBAL')} | "
-            f"{item.get('source_type', 'unknown')}"
+            f"{item.get('source_type', 'unknown')} | "
+            f"{item.get('id', '-')}"
         ): item
         for item in pending_items
     }
