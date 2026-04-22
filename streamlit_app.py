@@ -39,6 +39,13 @@ WEVIKO_PATH_MAP = {
     "⚠️ 고장 코드(DTC) (/dtc/)": "path_dtc",
 }
 
+VISION_DOC_TYPE_OPTIONS = {
+    "정비 지침/토크": {"schema_key": "path_manual", "path_hint": "/shop/manual/"},
+    "회로도/배선도": {"schema_key": "path_wiring", "path_hint": "/contents/etc/"},
+    "부품 제원/도해도": {"schema_key": "path_detail", "path_hint": "/item/detail/"},
+    "고장 코드 DTC": {"schema_key": "path_dtc", "path_hint": "/dtc/"},
+}
+
 DEFAULT_PROMPTS = {
     "crawling_ecommerce": (
         "자동차 부품 상세 페이지에서 부품번호, 차종, 연식, 호환 조건, 규격, 토크, "
@@ -268,32 +275,28 @@ def render_sidebar() -> str:
 
 
 def render_vision_input_mode() -> None:
-    st.title("📷 수동 캡처 (GSW 우회 입력)")
-    st.info("이미지를 업로드하면 AI가 분석하고 OEM 브랜드 정보와 함께 `pending_data` 검수 대기열로 전송합니다.")
+    st.title("📷 실전 수동 캡처 및 AI 분석")
+    st.info("💡 부품 번호를 몰라도 괜찮습니다. 아는 정보만 입력하면 AI가 문맥을 파악해 정리합니다.")
 
-    col1, col2, col3, col4 = st.columns(4)
-    part_number = col1.text_input("부품 번호 (필수)")
-    oem_brand = col2.text_input("OEM 브랜드", placeholder="HYUNDAI / KIA / MOBIS")
-    document_type = col3.selectbox("문서 종류", ["정비 지침", "도해도/스펙", "회로도"])
-    market = col4.selectbox("시장", ["GLOBAL", "VN", "KR", "US"])
+    st.subheader("📍 타겟 정보 (선택 입력)")
 
-    selected_label = st.selectbox(
-        "수집 경로 및 종류 선택",
-        options=list(WEVIKO_PATH_MAP.keys()) + ["직접 입력..."],
-        help="수집하려는 정보의 종류에 맞는 경로를 선택하세요. AI 스키마가 자동으로 매핑됩니다.",
-    )
-    direct_path = ""
-    if selected_label == "직접 입력...":
-        direct_path = st.text_input("새로운 경로 패턴 입력", placeholder="/new/path/")
-    schema_key, path_hint = resolve_path_selection(selected_label, direct_path)
+    col1, col2, col3 = st.columns(3)
+    vehicle_text = col1.text_input("차종 및 연식", placeholder="예: 엑센트 2015")
+    system_text = col2.text_input("시스템/부품명", placeholder="예: 앞 브레이크 패드")
+    part_number = col3.text_input("부품 번호 (알면 입력)", placeholder="예: 58350H6A00")
+
+    st.divider()
+
+    col4, col5 = st.columns(2)
+    selected_type = col4.selectbox("문서 종류", list(VISION_DOC_TYPE_OPTIONS.keys()))
+    type_config = VISION_DOC_TYPE_OPTIONS[selected_type]
+    schema_key = type_config["schema_key"]
+    path_hint = type_config["path_hint"]
+    market = col5.selectbox("타겟 시장", ["GLOBAL", "VN", "KR", "US"])
+
     st.caption(f"📍 현재 활성화된 AI 스키마: `{schema_key}` | 탐색 경로: `{path_hint}`")
 
-    prompt_text = st.text_area(
-        "Vision 프롬프트",
-        value=prompt_value(schema_key),
-        height=120,
-    )
-    uploaded_file = st.file_uploader("문서 업로드", type=["png", "jpg", "jpeg", "webp", "pdf"])
+    uploaded_file = st.file_uploader("문서/스크린샷 업로드 (최대 200MB)", type=["png", "jpg", "jpeg", "pdf"])
 
     if uploaded_file is not None:
         if (uploaded_file.type or "").startswith("image/"):
@@ -301,30 +304,56 @@ def render_vision_input_mode() -> None:
         else:
             st.caption(f"업로드 파일 타입: `{uploaded_file.type or 'unknown'}`")
 
-    if uploaded_file and st.button("🚀 AI 분석 및 대기열 전송", type="primary"):
-        if not part_number.strip():
-            st.error("부품 번호는 필수입니다.")
+    if uploaded_file and st.button("🚀 캡처 데이터 AI 분석 가동", type="primary", use_container_width=True):
+        if not supabase_available() or not llm_available():
+            st.error("환경 변수(Supabase/Google API)가 설정되지 않았습니다.")
             return
 
-        with st.spinner("AI가 이미지를 분석하고 대기열에 저장하는 중입니다..."):
+        vehicle_clean = vehicle_text.strip()
+        system_clean = system_text.strip()
+        part_clean = part_number.strip()
+
+        if part_clean:
+            identifier = part_clean
+        elif vehicle_clean and system_clean:
+            identifier = f"[{vehicle_clean}] {system_clean}"
+        elif vehicle_clean or system_clean:
+            identifier = vehicle_clean or system_clean
+        else:
+            identifier = "AI_AUTO_DETECT"
+
+        context_lines = [
+            f"Vehicle and model year hint: {vehicle_clean or 'Unknown'}",
+            f"System or part hint: {system_clean or 'Unknown'}",
+            f"Operator identifier: {identifier}",
+            f"Selected schema key: {schema_key}",
+            f"Selected path hint: {path_hint}",
+            f"Selected market: {market}",
+        ]
+
+        with st.spinner(f"'{identifier}' 문서를 해독 중입니다. 잠시만 기다려주세요..."):
             analysis_result, queue_result = process_vision_and_save(
                 file_bytes=uploaded_file.getvalue(),
                 file_type=uploaded_file.type,
-                part_num=part_number.strip(),
+                part_num=identifier,
                 doc_type_key=schema_key,
                 market=market,
-                oem_brand=oem_brand.strip(),
                 source_path_hint=path_hint,
-                document_type=document_type,
-                prompt_override=f"{prompt_text}\n\nSelected schema key: {schema_key}\nSelected path hint: {path_hint}",
+                document_type=selected_type,
+                prompt_override=f"{prompt_value(schema_key)}\n\n" + "\n".join(context_lines),
             )
 
         st.session_state["last_vision_result"] = analysis_result
+
         if queue_result["saved"]:
-            st.success("분석 완료! 데이터가 `pending_data` 검수 대기열로 이동했습니다.")
+            st.success("✅ 데이터 추출 성공! '검수 대기열'로 이동했습니다.")
         else:
-            st.warning("분석은 완료됐지만 대기열 저장은 되지 않았습니다.")
+            st.warning("분석은 완료됐지만 검수 대기열 저장은 되지 않았습니다.")
+
         st.caption(queue_result["message"])
+
+        with st.expander("AI 추출 결과 확인 (JSON)", expanded=True):
+            st.json(analysis_result)
 
     if st.session_state.get("last_vision_result") is not None:
         st.subheader("최근 Vision 분석 결과")
