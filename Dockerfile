@@ -14,11 +14,13 @@ RUN if ! id -u pwuser >/dev/null 2>&1; then \
 WORKDIR /home/pwuser/app
 
 COPY requirements.txt ./
-COPY requirements-streamlit.txt ./
-COPY requirements-weviko-crawler.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    python -m pip install --no-cache-dir -r requirements.txt
 
-COPY --chown=pwuser:pwuser . .
+COPY --chown=pwuser:pwuser main.py ./main.py
+COPY --chown=pwuser:pwuser streamlit_app.py ./streamlit_app.py
+COPY --chown=pwuser:pwuser streamlit_services.py ./streamlit_services.py
+COPY --chown=pwuser:pwuser weviko_factory.py ./weviko_factory.py
 
 ENV PYTHONUNBUFFERED=1 \
     STREAMLIT_SERVER_HEADLESS=true \
