@@ -9,9 +9,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from streamlit_services import (
-    analyze_uploaded_image,
     approve_pending_item,
-    enqueue_pending_vision_result,
     fetch_dead_letters,
     fetch_parts_count,
     fetch_parts_export,
@@ -20,6 +18,7 @@ from streamlit_services import (
     get_config_prompt,
     llm_available,
     load_config_prompts,
+    process_vision_and_save,
     reject_pending_item,
     save_config_prompt,
     save_part_translation,
@@ -294,10 +293,13 @@ def render_vision_input_mode() -> None:
         value=prompt_value(schema_key),
         height=120,
     )
-    uploaded_file = st.file_uploader("스크린샷 업로드", type=["png", "jpg", "jpeg", "webp"])
+    uploaded_file = st.file_uploader("문서 업로드", type=["png", "jpg", "jpeg", "webp", "pdf"])
 
     if uploaded_file is not None:
-        st.image(uploaded_file, caption="업로드 미리보기", use_container_width=True)
+        if (uploaded_file.type or "").startswith("image/"):
+            st.image(uploaded_file, caption="업로드 미리보기", use_container_width=True)
+        else:
+            st.caption(f"업로드 파일 타입: `{uploaded_file.type or 'unknown'}`")
 
     if uploaded_file and st.button("🚀 AI 분석 및 대기열 전송", type="primary"):
         if not part_number.strip():
@@ -305,24 +307,16 @@ def render_vision_input_mode() -> None:
             return
 
         with st.spinner("AI가 이미지를 분석하고 대기열에 저장하는 중입니다..."):
-            analysis_result, analysis_storage = analyze_uploaded_image(
+            analysis_result, queue_result = process_vision_and_save(
                 file_bytes=uploaded_file.getvalue(),
-                mime_type=uploaded_file.type or "image/png",
-                part_number=part_number.strip(),
-                oem_brand=oem_brand.strip(),
-                schema_key=schema_key,
-                source_path_hint=path_hint,
-                document_type=document_type,
-                prompt_text=f"{prompt_text}\n\nSelected schema key: {schema_key}\nSelected path hint: {path_hint}",
-            )
-            queue_result = enqueue_pending_vision_result(
-                part_number=part_number.strip(),
-                oem_brand=oem_brand.strip(),
-                schema_key=schema_key,
-                source_path_hint=path_hint,
+                file_type=uploaded_file.type,
+                part_num=part_number.strip(),
+                doc_type_key=schema_key,
                 market=market,
+                oem_brand=oem_brand.strip(),
+                source_path_hint=path_hint,
                 document_type=document_type,
-                analysis_payload=analysis_result,
+                prompt_override=f"{prompt_text}\n\nSelected schema key: {schema_key}\nSelected path hint: {path_hint}",
             )
 
         st.session_state["last_vision_result"] = analysis_result
@@ -330,7 +324,6 @@ def render_vision_input_mode() -> None:
             st.success("분석 완료! 데이터가 `pending_data` 검수 대기열로 이동했습니다.")
         else:
             st.warning("분석은 완료됐지만 대기열 저장은 되지 않았습니다.")
-        st.caption(analysis_storage["message"])
         st.caption(queue_result["message"])
 
     if st.session_state.get("last_vision_result") is not None:

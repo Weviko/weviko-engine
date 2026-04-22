@@ -222,6 +222,11 @@ def get_config_prompt(prompt_key: str, fallback_text: str) -> tuple[str, str]:
     return prompts.get(prompt_key, fallback_text), source
 
 
+def get_system_prompt(prompt_key: str, fallback_text: str = "") -> str:
+    prompt_text, _ = get_config_prompt(prompt_key, fallback_text)
+    return prompt_text
+
+
 def save_config_prompt(prompt_key: str, prompt_text: str) -> dict[str, Any]:
     prompts, _ = load_config_prompts({})
     prompts[prompt_key] = prompt_text
@@ -307,6 +312,122 @@ def _insert_remote(table_name: str, payload: dict[str, Any]) -> tuple[bool, str]
         return True, "Supabase에 저장되었습니다."
     except Exception as exc:
         return False, str(exc)
+
+
+def _extract_response_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if text:
+                    parts.append(str(text))
+            elif item is not None:
+                parts.append(str(item))
+        return "\n".join(parts).strip()
+    return str(content).strip()
+
+
+def _parse_json_text(raw_text: str) -> dict[str, Any]:
+    cleaned_text = raw_text.replace("```json", "").replace("```", "").strip()
+    if not cleaned_text:
+        return {}
+    try:
+        loaded = json.loads(cleaned_text)
+    except json.JSONDecodeError:
+        return {"raw_response": cleaned_text}
+    if isinstance(loaded, dict):
+        return loaded
+    return {"raw_response": loaded}
+
+
+def process_vision_and_save(
+    file_bytes: bytes,
+    file_type: str | None,
+    part_num: str,
+    doc_type_key: str,
+    market: str,
+    *,
+    oem_brand: str = "",
+    source_path_hint: str = "",
+    document_type: str = "",
+    prompt_override: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    llm = get_cached_llm()
+    mime_type = file_type or "image/jpeg"
+    system_prompt = prompt_override or get_system_prompt(
+        doc_type_key,
+        "자동차 정비 문서에서 측정 가능한 팩트와 핵심 구조화 정보만 JSON으로 추출하세요.",
+    )
+
+    if llm is None:
+        payload = {
+            "part_number": part_num or "Unknown",
+            "oem_brand": oem_brand,
+            "schema_key": doc_type_key,
+            "source_path_hint": source_path_hint,
+            "document_type": document_type,
+            "market": market,
+            "summary": "Gemini가 설정되지 않아 예시 기반 결과를 반환했습니다.",
+            "extracted_facts": {"inspection_required": True},
+            "cautions": ["GOOGLE_API_KEY 또는 GEMINI_API_KEY가 필요합니다."],
+            "analysis_mode": "fallback",
+            "captured_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    else:
+        file_b64 = base64.b64encode(file_bytes).decode("utf-8")
+        msg = HumanMessage(
+            content=[
+                {"type": "text", "text": system_prompt},
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{file_b64}"}},
+            ]
+        )
+        response = llm.invoke([msg])
+        raw_text = _extract_response_text(getattr(response, "content", response))
+        payload = _parse_json_text(raw_text)
+        payload.setdefault("part_number", part_num or "Unknown")
+        payload.setdefault("oem_brand", oem_brand)
+        payload.setdefault("schema_key", doc_type_key)
+        payload.setdefault("source_path_hint", source_path_hint)
+        payload.setdefault("document_type", document_type)
+        payload.setdefault("market", market)
+        payload["analysis_mode"] = "gemini"
+        payload["captured_at"] = datetime.now().isoformat(timespec="seconds")
+
+    _insert_remote(
+        vision_table_name(),
+        {
+            "part_number": payload.get("part_number", part_num or "Unknown"),
+            "oem_brand": payload.get("oem_brand", oem_brand),
+            "schema_key": payload.get("schema_key", doc_type_key),
+            "source_path_hint": payload.get("source_path_hint", source_path_hint),
+            "document_type": payload.get("document_type", document_type or "Unknown"),
+            "analysis": payload,
+            "created_at": _utc_now_iso(),
+        },
+    )
+
+    pending_payload = {
+        "part_number": payload.get("part_number", part_num or "Unknown"),
+        "oem_brand": payload.get("oem_brand", oem_brand),
+        "schema_key": payload.get("schema_key", doc_type_key),
+        "source_path_hint": payload.get("source_path_hint", source_path_hint),
+        "market": market,
+        "document_type": payload.get("document_type", document_type),
+        "source_type": doc_type_key,
+        "raw_json": payload,
+        "status": "pending",
+        "created_at": _utc_now_iso(),
+    }
+    saved, message = _insert_remote(pending_table_name(), pending_payload)
+    return payload, {
+        "saved": saved,
+        "message": message,
+        "mime_type": mime_type,
+        "prompt_key": doc_type_key,
+    }
 
 
 def analyze_uploaded_image(
