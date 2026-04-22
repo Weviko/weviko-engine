@@ -16,8 +16,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --chown=pwuser:pwuser . .
 
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 \
+    STREAMLIT_SERVER_HEADLESS=true \
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
+    PORT=10000
 
 USER pwuser
 
-CMD ["python", "main.py"]
+EXPOSE 10000
+
+CMD ["sh", "-c", "streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port ${PORT:-10000}"]

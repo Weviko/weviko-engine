@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: weviko-engine
+    runtime: docker
+    plan: standard
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeployTrigger: commit
