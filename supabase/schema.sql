@@ -12,6 +12,7 @@ create table if not exists public.parts (
   market text,
   document_type text,
   source_type text,
+  status text,
   spec_data jsonb not null default '{}'::jsonb,
   translations jsonb,
   created_at timestamptz not null default now(),
@@ -24,6 +25,7 @@ alter table public.parts add column if not exists source_path_hint text;
 alter table public.parts add column if not exists market text;
 alter table public.parts add column if not exists document_type text;
 alter table public.parts add column if not exists source_type text;
+alter table public.parts add column if not exists status text;
 alter table public.parts add column if not exists spec_data jsonb not null default '{}'::jsonb;
 alter table public.parts add column if not exists translations jsonb;
 alter table public.parts add column if not exists created_at timestamptz not null default now();
@@ -32,6 +34,7 @@ alter table public.parts add column if not exists updated_at timestamptz not nul
 create index if not exists idx_parts_market on public.parts (market);
 create index if not exists idx_parts_oem_brand on public.parts (oem_brand);
 create index if not exists idx_parts_schema_key on public.parts (schema_key);
+create index if not exists idx_parts_status on public.parts (status);
 create index if not exists idx_parts_created_at on public.parts (created_at desc);
 
 -- 2. Pending review queue
@@ -188,6 +191,10 @@ values
   (
     'path_dtc',
     '고장 코드(DTC) 자료입니다. 코드, 증상, 원인, 점검 절차, 권장 조치를 구조화하세요.'
+  ),
+  (
+    'confidence_threshold',
+    '90'
   )
 on conflict (prompt_key) do update
 set

@@ -227,6 +227,14 @@ def get_system_prompt(prompt_key: str, fallback_text: str = "") -> str:
     return prompt_text
 
 
+def get_config_int_value(config_key: str, default_value: int) -> int:
+    raw_value = get_system_prompt(config_key, str(default_value)).strip()
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return default_value
+
+
 def save_config_prompt(prompt_key: str, prompt_text: str) -> dict[str, Any]:
     prompts, _ = load_config_prompts({})
     prompts[prompt_key] = prompt_text
@@ -760,6 +768,87 @@ def save_part_translation(part_number: str, translations: dict[str, Any]) -> dic
         }
 
 
+def save_crawled_data(
+    raw_json: dict[str, Any],
+    part_number: str,
+    *,
+    market: str = "GLOBAL",
+    schema_key: str = "",
+    source_path_hint: str = "",
+    source_type: str = "crawl_factory",
+    document_type: str = "크롤링 수집 결과",
+) -> dict[str, Any]:
+    client = get_cached_supabase_client()
+    if client is None:
+        return {
+            "saved": False,
+            "destination": "none",
+            "message": "Supabase가 설정되지 않아 크롤링 결과를 저장할 수 없습니다.",
+        }
+
+    confidence_threshold = get_config_int_value("confidence_threshold", 90)
+    score = raw_json.get("confidence_score", 0)
+    try:
+        score_value = int(score)
+    except (TypeError, ValueError):
+        score_value = 0
+
+    timestamp = _utc_now_iso()
+
+    try:
+        if score_value >= confidence_threshold:
+            client.table(parts_table_name()).upsert(
+                {
+                    "part_number": part_number,
+                    "market": market,
+                    "schema_key": schema_key,
+                    "source_path_hint": source_path_hint,
+                    "document_type": document_type,
+                    "source_type": source_type,
+                    "status": "auto_verified",
+                    "spec_data": raw_json,
+                    "updated_at": timestamp,
+                },
+                on_conflict="part_number",
+            ).execute()
+            return {
+                "saved": True,
+                "destination": "Direct",
+                "confidence_score": score_value,
+                "confidence_threshold": confidence_threshold,
+                "message": f"신뢰도 {score_value}점으로 정식 DB에 자동 등록했습니다.",
+            }
+
+        client.table(pending_table_name()).insert(
+            {
+                "part_number": part_number,
+                "market": market,
+                "schema_key": schema_key,
+                "source_path_hint": source_path_hint,
+                "document_type": document_type,
+                "source_type": source_type,
+                "raw_json": raw_json,
+                "status": "pending",
+                "created_at": timestamp,
+            }
+        ).execute()
+        return {
+            "saved": True,
+            "destination": "Pending",
+            "confidence_score": score_value,
+            "confidence_threshold": confidence_threshold,
+            "message": f"신뢰도 {score_value}점으로 검수 대기열에 저장했습니다.",
+        }
+    except Exception as exc:
+        return {
+            "saved": False,
+            "destination": "none",
+            "confidence_score": score_value,
+            "confidence_threshold": confidence_threshold,
+            "message": f"크롤링 결과 저장 실패: {exc}",
+        }
+
+
 def persist_factory_rows(
     *,
     rows: list[dict[str, Any]],
@@ -780,6 +869,8 @@ def persist_factory_rows(
 
     saved_count = 0
     skipped_count = 0
+    direct_count = 0
+    pending_count = 0
     errors: list[str] = []
 
     for row in rows:
@@ -805,19 +896,21 @@ def persist_factory_rows(
 
         try:
             if destination == "parts":
-                client.table(parts_table_name()).upsert(
-                    {
-                        "part_number": identifier,
-                        "market": market,
-                        "schema_key": schema_key,
-                        "source_path_hint": source_path_hint,
-                        "document_type": document_type,
-                        "source_type": source_type,
-                        "spec_data": payload,
-                        "updated_at": _utc_now_iso(),
-                    },
-                    on_conflict="part_number",
-                ).execute()
+                save_result = save_crawled_data(
+                    payload,
+                    identifier,
+                    market=market,
+                    schema_key=schema_key,
+                    source_path_hint=source_path_hint,
+                    source_type=source_type,
+                    document_type=document_type,
+                )
+                if not save_result["saved"]:
+                    raise RuntimeError(save_result["message"])
+                if save_result["destination"] == "Direct":
+                    direct_count += 1
+                elif save_result["destination"] == "Pending":
+                    pending_count += 1
             else:
                 client.table(pending_table_name()).insert(
                     {
@@ -832,6 +925,7 @@ def persist_factory_rows(
                         "created_at": _utc_now_iso(),
                     }
                 ).execute()
+                pending_count += 1
             saved_count += 1
         except Exception as exc:
             errors.append(str(exc))
@@ -840,6 +934,8 @@ def persist_factory_rows(
         f"{saved_count}건 저장 완료"
         f"{', ' + str(skipped_count) + '건 건너뜀' if skipped_count else ''}"
     )
+    if direct_count or pending_count:
+        message = f"{message} | Direct {direct_count}건 / Pending {pending_count}건"
     if errors:
         message = f"{message} | 오류 {len(errors)}건: {errors[0]}"
 
@@ -847,6 +943,8 @@ def persist_factory_rows(
         "saved": saved_count > 0 and not errors,
         "saved_count": saved_count,
         "skipped_count": skipped_count,
+        "direct_count": direct_count,
+        "pending_count": pending_count,
         "errors": errors,
         "message": message,
     }

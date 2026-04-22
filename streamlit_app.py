@@ -84,6 +84,7 @@ DEFAULT_PROMPTS = {
     ),
     "proxy_url": "",
     "custom_user_agent": "",
+    "confidence_threshold": "90",
 }
 
 PIPELINE_MODES = [
@@ -643,6 +644,7 @@ def render_settings_mode() -> None:
         st.markdown("대규모 양산 시 타겟 사이트 방화벽 우회를 위한 설정입니다.")
         proxy_value, _ = get_config_prompt("proxy_url", "")
         user_agent_value, _ = get_config_prompt("custom_user_agent", "")
+        confidence_threshold_value, _ = get_config_prompt("confidence_threshold", "90")
 
         proxy_url = st.text_input(
             "Proxy URL (형식: http://user:pass@ip:port)",
@@ -653,14 +655,25 @@ def render_settings_mode() -> None:
             value=user_agent_value or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             height=100,
         )
+        confidence_threshold = st.number_input(
+            "자동 직행 신뢰도 기준점",
+            min_value=0,
+            max_value=100,
+            value=int(confidence_threshold_value or "90"),
+            step=1,
+            help="이 점수 이상이면 검수 없이 정식 DB로 자동 등록합니다.",
+        )
 
         if st.button("🛡️ 보안 설정 저장", type="primary"):
             proxy_result = save_config_prompt("proxy_url", proxy_url)
             ua_result = save_config_prompt("custom_user_agent", user_agent)
-            if (proxy_result["remote_saved"] or proxy_result["local_saved"]) and (
-                ua_result["remote_saved"] or ua_result["local_saved"]
+            threshold_result = save_config_prompt("confidence_threshold", str(confidence_threshold))
+            if (
+                (proxy_result["remote_saved"] or proxy_result["local_saved"])
+                and (ua_result["remote_saved"] or ua_result["local_saved"])
+                and (threshold_result["remote_saved"] or threshold_result["local_saved"])
             ):
-                st.success("프록시와 User-Agent 설정이 저장되었습니다.")
+                st.success("프록시, User-Agent, 신뢰도 기준점이 저장되었습니다.")
             else:
                 st.error("일부 설정 저장에 실패했습니다.")
 
