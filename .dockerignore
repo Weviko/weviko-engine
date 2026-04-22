@@ -1,9 +1,12 @@
 # Ignore everything by default so the Docker build context stays small.
 *
 
-# Keep only the files needed to build and run the crawler image.
+# Keep only the files needed to build and run the Render web service image.
 !Dockerfile
 !.dockerignore
 !main.py
 !requirements.txt
 !requirements-weviko-crawler.txt
+!requirements-streamlit.txt
+!streamlit_app.py
+!weviko_factory.py
