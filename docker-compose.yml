@@ -1,0 +1,15 @@
+services:
+  weviko-crawler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: weviko-crawler:local
+    container_name: weviko-crawler
+    env_file:
+      - .env
+    user: pwuser
+    init: true
+    ipc: host
+    security_opt:
+      - seccomp=./seccomp_profile.json
+    restart: unless-stopped

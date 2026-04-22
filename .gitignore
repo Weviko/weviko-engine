@@ -1,0 +1,24 @@
+.env
+.venv/
+.venv313/
+venv/
+.tmp-py313/
+node_modules/
+__pycache__/
+*.py[cod]
+*.log
+
+# Local workspace / unrelated directories
+autoplatform/
+저장소이름/
+/[0-9A-Za-z_][0-9A-Za-z_][0-9A-Za-z_][0-9A-Za-z_][0-9A-Za-z_][0-9A-Za-z_][0-9A-Za-z_][0-9A-Za-z_]
+
+# Python / Streamlit caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.streamlit/
+
+# OS / editor
+.DS_Store
+Thumbs.db
