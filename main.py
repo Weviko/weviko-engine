@@ -537,12 +537,18 @@ class WevikoBrain:
         llm: Any = None,
         cache_table: str = "crawling_logs",
         parts_table: str = "parts",
+        write_destination: str = "parts",
+        schema_key: str = "path_detail",
+        source_type: str = "crawl_factory",
         target_market: str = "GLOBAL",
     ):
         self.supabase = supabase_client
         self.llm = llm
         self.cache_table = cache_table
         self.parts_table = parts_table
+        self.write_destination = write_destination
+        self.schema_key = schema_key
+        self.source_type = source_type
         self.target_market = target_market
         self.route_status_counts: dict[str, int] = {}
         self.rows: list[dict[str, Any]] = []
@@ -586,17 +592,19 @@ class WevikoBrain:
                 .execute()
             )
 
-            if result is not None:
+            if result is not None and self.write_destination == "parts":
                 (
                     self.supabase.table(self.parts_table)
                     .upsert(
                         {
-                            "url": url,
                             "part_number": result.part_number,
-                            "extracted_facts": result.extracted_facts,
-                            "content_hash": content_hash,
+                            "market": self.target_market,
+                            "schema_key": self.schema_key,
+                            "source_type": self.source_type,
+                            "spec_data": result.extracted_facts,
                             "updated_at": timestamp,
-                        }
+                        },
+                        on_conflict="part_number",
                     )
                     .execute()
                 )
@@ -767,6 +775,10 @@ async def run_factory_async(
     discovery_max_depth: int | None = None,
     max_urls: int | None = None,
     blocked_resource_types: set[str] | None = None,
+    user_agent: str | None = None,
+    write_destination: str = "parts",
+    schema_key: str = "path_detail",
+    source_type: str = "crawl_factory",
 ) -> CrawlRunResult:
     print("Starting Weviko crawling pipeline...\n")
 
@@ -804,6 +816,9 @@ async def run_factory_async(
         llm=build_llm(),
         cache_table=os.getenv("WEVIKO_CACHE_TABLE", "crawling_logs"),
         parts_table=os.getenv("WEVIKO_PARTS_TABLE", "parts"),
+        write_destination=write_destination,
+        schema_key=schema_key,
+        source_type=source_type,
         target_market=target_market,
     )
     await spider.discover_urls(resolved_start_url)
@@ -844,7 +859,11 @@ async def run_factory_async(
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(**launch_kwargs)
         try:
-            context = await browser.new_context(locale="en-US")
+            context_kwargs: dict[str, Any] = {"locale": "en-US"}
+            if user_agent:
+                context_kwargs["user_agent"] = user_agent
+
+            context = await browser.new_context(**context_kwargs)
             await Stealth().apply_stealth_async(context)
 
             resolved_blocked_resource_types = (
@@ -912,6 +931,10 @@ def run_factory(
     discovery_max_depth: int | None = None,
     max_urls: int | None = None,
     blocked_resource_types: set[str] | None = None,
+    user_agent: str | None = None,
+    write_destination: str = "parts",
+    schema_key: str = "path_detail",
+    source_type: str = "crawl_factory",
     log_callback: Callable[[str], None] | None = None,
 ) -> CrawlRunResult:
     capture = CallbackWriter(log_callback)
@@ -929,6 +952,10 @@ def run_factory(
                 discovery_max_depth=discovery_max_depth,
                 max_urls=max_urls,
                 blocked_resource_types=blocked_resource_types,
+                user_agent=user_agent,
+                write_destination=write_destination,
+                schema_key=schema_key,
+                source_type=source_type,
             )
         )
     capture.flush()

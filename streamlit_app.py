@@ -7,6 +7,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+from weviko_factory import run_factory
 
 from streamlit_services import (
     approve_pending_item,
@@ -18,6 +19,7 @@ from streamlit_services import (
     get_config_prompt,
     llm_available,
     load_config_prompts,
+    persist_factory_rows,
     process_vision_and_save,
     reject_pending_item,
     save_config_prompt,
@@ -44,6 +46,12 @@ VISION_DOC_TYPE_OPTIONS = {
     "회로도/배선도": {"schema_key": "path_wiring", "path_hint": "/contents/etc/"},
     "부품 제원/도해도": {"schema_key": "path_detail", "path_hint": "/item/detail/"},
     "고장 코드 DTC": {"schema_key": "path_dtc", "path_hint": "/dtc/"},
+}
+
+FACTORY_SCHEMA_OPTIONS = {
+    "정비 지침서 (/shop/manual/)": {"schema_key": "path_manual", "path_hint": "/shop/manual/"},
+    "부품 제원/호환성 (/item/detail/)": {"schema_key": "path_detail", "path_hint": "/item/detail/"},
+    "포럼/실전 팁 (/community/)": {"schema_key": "path_community", "path_hint": "/community/"},
 }
 
 DEFAULT_PROMPTS = {
@@ -74,15 +82,21 @@ DEFAULT_PROMPTS = {
     "path_dtc": (
         "고장 코드(DTC) 자료입니다. 코드, 증상, 원인, 점검 절차, 권장 조치를 구조화하세요."
     ),
+    "proxy_url": "",
+    "custom_user_agent": "",
 }
 
-MODES = [
-    "📷 수동 캡처(Vision) 입력",
-    "🕵️ 데이터 검수 및 DB 이관",
+PIPELINE_MODES = [
+    "📷 수동 캡처(Vision)",
+    "🏭 대규모 양산 팩토리(URL)",
+]
+
+MANAGEMENT_MODES = [
+    "🕵️ 데이터 검수소 (H-i-t-L)",
     "🌐 다국어 번역 엔진",
-    "⚙️ 시스템 프롬프트 관리",
-    "🏥 실패 URL 관리 (DLQ)",
-    "📊 통합 DB 추출 (CSV)",
+    "⚙️ 시스템 환경 설정",
+    "🏥 실패 URL 병원",
+    "📊 통합 현황 및 백업",
 ]
 
 
@@ -94,6 +108,8 @@ def convert_df(df: pd.DataFrame) -> bytes:
 def init_state() -> None:
     if "logged_in" not in st.session_state:
         st.session_state["logged_in"] = False
+    if "active_section" not in st.session_state:
+        st.session_state["active_section"] = "데이터 수집"
     if "prompt_values" not in st.session_state:
         prompt_values, source = load_config_prompts(DEFAULT_PROMPTS)
         st.session_state["prompt_values"] = prompt_values
@@ -104,6 +120,8 @@ def init_state() -> None:
         st.session_state["last_vision_result"] = None
     if "last_translation_results" not in st.session_state:
         st.session_state["last_translation_results"] = {}
+    if "last_factory_result" not in st.session_state:
+        st.session_state["last_factory_result"] = None
 
 
 def inject_styles() -> None:
@@ -200,7 +218,7 @@ def ensure_login() -> None:
     if st.session_state["logged_in"]:
         return
 
-    st.title("🔒 Weviko OS v4.0 Login")
+    st.title("🔒 Weviko OS v5.0 Login")
     password = st.text_input("접근 암호", type="password")
     if st.button("시스템 가동", type="primary", use_container_width=True):
         if password == ADMIN_PASSWORD:
@@ -214,11 +232,11 @@ def render_header() -> None:
     st.markdown(
         """
         <div class="weviko-hero">
-            <div class="weviko-kicker">Weviko OS v4.0</div>
+            <div class="weviko-kicker">Weviko OS v5.0</div>
             <div class="weviko-title">Master Command Center</div>
             <p class="weviko-copy">
-                수동 캡처, 검수 대기열, 다국어 번역, 프롬프트 운영, 실패 URL 관리, CSV 백업까지
-                Supabase 중심 운영 흐름으로 통합했습니다.
+                수동 캡처, URL 팩토리, 검수 대기열, 다국어 번역, 운영 설정, 백업까지
+                하나의 운영 콘솔에서 이어서 관리합니다.
             </p>
         </div>
         """,
@@ -265,8 +283,15 @@ def resolve_path_selection(selected_label: str, direct_path: str) -> tuple[str, 
 
 def render_sidebar() -> str:
     with st.sidebar:
-        st.title("🌍 Weviko OS v4.0")
-        mode = st.radio("작업 모드", MODES)
+        st.title("🌍 Weviko OS v5.0")
+        st.caption("Global Automotive Data Pipeline")
+        section = st.radio("작업 영역", ["데이터 수집", "데이터 관리/제어"])
+        st.session_state["active_section"] = section
+        st.divider()
+        if section == "데이터 수집":
+            mode = st.radio("데이터 수집 파이프라인", PIPELINE_MODES)
+        else:
+            mode = st.radio("데이터 관리 및 제어", MANAGEMENT_MODES)
         st.divider()
         if st.button("🔌 로그아웃", use_container_width=True):
             st.session_state["logged_in"] = False
@@ -360,8 +385,119 @@ def render_vision_input_mode() -> None:
         st.json(st.session_state["last_vision_result"])
 
 
+def render_factory_mode() -> None:
+    st.title("🏭 대규모 크롤링 양산 팩토리")
+    st.markdown("특정 카테고리 URL을 입력하면, 하위 페이지를 찾아 병렬 수집한 뒤 원하는 목적지로 보냅니다.")
+
+    start_url = st.text_input(
+        "시작 카테고리 URL",
+        placeholder="예: https://www.weviko.com/community/parts-info",
+    )
+
+    col1, col2 = st.columns(2)
+    selected_schema_label = col1.selectbox("수집 타겟 및 스키마", list(FACTORY_SCHEMA_OPTIONS.keys()))
+    worker_count = col2.slider(
+        "동시 워커(Worker) 수",
+        1,
+        10,
+        3,
+        help="숫자가 높을수록 빠르지만 차단 위험이 커집니다.",
+    )
+
+    col3, col4 = st.columns(2)
+    max_urls = col3.number_input("최대 탐색 URL 수", min_value=10, max_value=5000, value=100, step=10)
+    max_depth = col4.slider("탐색 깊이", 1, 5, 2)
+
+    destination_label = st.radio(
+        "데이터 도착지 설정",
+        [
+            "1️⃣ 안전 모드: 수집 후 '검수 대기열(Pending)'로 보내기",
+            "2️⃣ 직행 모드: 수집 즉시 '정식 DB(Parts)'에 적재하기",
+        ],
+    )
+
+    schema_config = FACTORY_SCHEMA_OPTIONS[selected_schema_label]
+    schema_key = schema_config["schema_key"]
+    path_hint = schema_config["path_hint"]
+
+    proxy_value, _ = get_config_prompt("proxy_url", "")
+    user_agent_value, _ = get_config_prompt("custom_user_agent", "")
+
+    if st.button("🔥 팩토리 풀가동 시작", type="primary", use_container_width=True):
+        if not start_url.strip():
+            st.error("시작 URL을 입력해주세요.")
+            return
+
+        log_box = st.empty()
+        logs: list[str] = []
+
+        def handle_log(line: str) -> None:
+            logs.append(line)
+            log_box.code("\n".join(logs[-30:]), language="bash")
+
+        previous_proxy = os.getenv("PLAYWRIGHT_PROXY_SERVER")
+        destination = "pending" if destination_label.startswith("1️⃣") else "parts"
+
+        if proxy_value.strip():
+            os.environ["PLAYWRIGHT_PROXY_SERVER"] = proxy_value.strip()
+
+        try:
+            with st.spinner("스파이더가 URL을 수집하고 AI 정제를 진행 중입니다..."):
+                run_result = run_factory(
+                    start_url=start_url.strip(),
+                    num_workers=worker_count,
+                    target_market="GLOBAL",
+                    product_path_hint=path_hint,
+                    discovery_extra_path_hints=[path_hint],
+                    max_urls=int(max_urls),
+                    discovery_max_depth=max_depth,
+                    user_agent=user_agent_value.strip() or None,
+                    write_destination="none",
+                    schema_key=schema_key,
+                    source_type="crawl_factory",
+                    log_callback=handle_log,
+                )
+        finally:
+            if previous_proxy is None:
+                os.environ.pop("PLAYWRIGHT_PROXY_SERVER", None)
+            else:
+                os.environ["PLAYWRIGHT_PROXY_SERVER"] = previous_proxy
+
+        persist_result = persist_factory_rows(
+            rows=run_result.rows,
+            destination=destination,
+            market=run_result.target_market,
+            schema_key=schema_key,
+            source_path_hint=path_hint,
+            source_type="crawl_factory",
+            document_type=selected_schema_label,
+        )
+
+        st.session_state["last_factory_result"] = {
+            "result": run_result,
+            "persist": persist_result,
+        }
+
+        st.success(
+            f"✅ URL {len(run_result.queued_urls):,}개 탐색 완료, 결과 {persist_result['saved_count']:,}건 저장"
+        )
+        st.caption(persist_result["message"])
+
+        if run_result.route_status_counts:
+            status_df = pd.DataFrame(
+                [
+                    {"route_status": key, "count": value}
+                    for key, value in sorted(run_result.route_status_counts.items())
+                ]
+            )
+            st.dataframe(status_df, use_container_width=True, hide_index=True)
+
+        if run_result.rows:
+            st.dataframe(pd.DataFrame(run_result.rows), use_container_width=True, hide_index=True)
+
+
 def render_review_mode() -> None:
-    st.title("🕵️ 최종 데이터 검수소")
+    st.title("🕵️ 데이터 검수소 (H-i-t-L)")
     st.markdown("수동 캡처나 자동 파이프라인에서 수집한 `pending_data` 대기열을 승인하거나 반려합니다.")
 
     if not supabase_available():
@@ -474,36 +610,63 @@ def render_translation_mode() -> None:
         st.json(st.session_state["last_translation_results"][preview_key])
 
 
-def render_prompt_mode() -> None:
-    st.title("⚙️ AI 프롬프트 중앙 관리")
-    prompt_key = st.selectbox(
-        "관리할 프롬프트",
-        [
-            "crawling_ecommerce",
-            "vision_gsw",
-            "translation_vn",
-            "path_manual",
-            "path_detail",
-            "path_wiring",
-            "path_community",
-            "path_dtc",
-        ],
-    )
-    current_value, source = get_config_prompt(prompt_key, DEFAULT_PROMPTS[prompt_key])
-    new_value = st.text_area("프롬프트 내용", value=current_value, height=220)
-    st.caption(f"현재 로드 소스: {source}")
+def render_settings_mode() -> None:
+    st.title("⚙️ 프롬프트 및 우회 설정")
+    tab1, tab2 = st.tabs(["🧠 AI 시스템 프롬프트", "🛡️ 봇 우회 (Proxy) 설정"])
 
-    if st.button("💾 DB에 프롬프트 저장", type="primary"):
-        result = save_config_prompt(prompt_key, new_value)
-        refresh_prompts()
-        if result["remote_saved"] or result["local_saved"]:
-            st.success(result["message"])
-        else:
-            st.error(result["message"])
+    with tab1:
+        prompt_key = st.selectbox(
+            "관리할 프롬프트",
+            [
+                "path_manual",
+                "path_detail",
+                "path_wiring",
+                "path_dtc",
+                "path_community",
+                "translation_vn",
+                "crawling_ecommerce",
+            ],
+        )
+        current_value, source = get_config_prompt(prompt_key, DEFAULT_PROMPTS[prompt_key])
+        new_value = st.text_area("프롬프트 내용", value=current_value, height=220)
+        st.caption(f"현재 로드 소스: {source}")
+
+        if st.button("💾 프롬프트 저장", type="primary"):
+            result = save_config_prompt(prompt_key, new_value)
+            refresh_prompts()
+            if result["remote_saved"] or result["local_saved"]:
+                st.success(result["message"])
+            else:
+                st.error(result["message"])
+
+    with tab2:
+        st.markdown("대규모 양산 시 타겟 사이트 방화벽 우회를 위한 설정입니다.")
+        proxy_value, _ = get_config_prompt("proxy_url", "")
+        user_agent_value, _ = get_config_prompt("custom_user_agent", "")
+
+        proxy_url = st.text_input(
+            "Proxy URL (형식: http://user:pass@ip:port)",
+            value=proxy_value,
+        )
+        user_agent = st.text_area(
+            "Custom User-Agent",
+            value=user_agent_value or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            height=100,
+        )
+
+        if st.button("🛡️ 보안 설정 저장", type="primary"):
+            proxy_result = save_config_prompt("proxy_url", proxy_url)
+            ua_result = save_config_prompt("custom_user_agent", user_agent)
+            if (proxy_result["remote_saved"] or proxy_result["local_saved"]) and (
+                ua_result["remote_saved"] or ua_result["local_saved"]
+            ):
+                st.success("프록시와 User-Agent 설정이 저장되었습니다.")
+            else:
+                st.error("일부 설정 저장에 실패했습니다.")
 
 
 def render_dead_letter_mode() -> None:
-    st.title("🏥 데드 레터 큐 (Dead Letter Queue)")
+    st.title("🏥 실패 URL 병원")
     if not supabase_available():
         st.error("Supabase 환경 변수가 설정되지 않았습니다.")
         return
@@ -516,7 +679,7 @@ def render_dead_letter_mode() -> None:
 
 
 def render_export_mode() -> None:
-    st.title("📊 Weviko 글로벌 데이터베이스 백업")
+    st.title("📊 통합 현황 및 백업")
     if not supabase_available():
         st.error("Supabase 환경 변수가 설정되지 않았습니다.")
         return
@@ -548,7 +711,7 @@ def render_export_mode() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Weviko Master Command Center", page_icon="🌍", layout="wide")
+    st.set_page_config(page_title="Weviko Master OS", page_icon="🌍", layout="wide")
     init_state()
     inject_styles()
     ensure_login()
@@ -557,15 +720,17 @@ def main() -> None:
     render_header()
     render_status()
 
-    if mode == "📷 수동 캡처(Vision) 입력":
+    if mode == "📷 수동 캡처(Vision)":
         render_vision_input_mode()
-    elif mode == "🕵️ 데이터 검수 및 DB 이관":
+    elif mode == "🏭 대규모 양산 팩토리(URL)":
+        render_factory_mode()
+    elif mode == "🕵️ 데이터 검수소 (H-i-t-L)":
         render_review_mode()
     elif mode == "🌐 다국어 번역 엔진":
         render_translation_mode()
-    elif mode == "⚙️ 시스템 프롬프트 관리":
-        render_prompt_mode()
-    elif mode == "🏥 실패 URL 관리 (DLQ)":
+    elif mode == "⚙️ 시스템 환경 설정":
+        render_settings_mode()
+    elif mode == "🏥 실패 URL 병원":
         render_dead_letter_mode()
     else:
         render_export_mode()

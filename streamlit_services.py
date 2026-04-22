@@ -760,6 +760,98 @@ def save_part_translation(part_number: str, translations: dict[str, Any]) -> dic
         }
 
 
+def persist_factory_rows(
+    *,
+    rows: list[dict[str, Any]],
+    destination: str,
+    market: str,
+    schema_key: str,
+    source_path_hint: str,
+    source_type: str = "crawl_factory",
+    document_type: str = "크롤링 수집 결과",
+) -> dict[str, Any]:
+    client = get_cached_supabase_client()
+    if client is None:
+        return {
+            "saved": False,
+            "saved_count": 0,
+            "message": "Supabase가 설정되지 않아 팩토리 결과를 저장할 수 없습니다.",
+        }
+
+    saved_count = 0
+    skipped_count = 0
+    errors: list[str] = []
+
+    for row in rows:
+        route_status = row.get("route_status", "")
+        extracted_facts = row.get("extracted_facts") or {}
+        part_number = (row.get("part_number") or "").strip()
+        identifier = part_number or row.get("final_url") or row.get("url") or "Unknown"
+
+        if route_status != "content_page" and not extracted_facts:
+            skipped_count += 1
+            continue
+
+        payload = {
+            "source_url": row.get("url", ""),
+            "final_url": row.get("final_url", ""),
+            "http_status": row.get("http_status"),
+            "route_status": route_status,
+            "route_reason": row.get("route_reason", ""),
+            "content_hash": row.get("content_hash", ""),
+            "compressed_chars": row.get("compressed_chars", 0),
+            "extracted_facts": extracted_facts,
+        }
+
+        try:
+            if destination == "parts":
+                client.table(parts_table_name()).upsert(
+                    {
+                        "part_number": identifier,
+                        "market": market,
+                        "schema_key": schema_key,
+                        "source_path_hint": source_path_hint,
+                        "document_type": document_type,
+                        "source_type": source_type,
+                        "spec_data": payload,
+                        "updated_at": _utc_now_iso(),
+                    },
+                    on_conflict="part_number",
+                ).execute()
+            else:
+                client.table(pending_table_name()).insert(
+                    {
+                        "part_number": identifier,
+                        "market": market,
+                        "schema_key": schema_key,
+                        "source_path_hint": source_path_hint,
+                        "document_type": document_type,
+                        "source_type": source_type,
+                        "raw_json": payload,
+                        "status": "pending",
+                        "created_at": _utc_now_iso(),
+                    }
+                ).execute()
+            saved_count += 1
+        except Exception as exc:
+            errors.append(str(exc))
+
+    message = (
+        f"{saved_count}건 저장 완료"
+        f"{', ' + str(skipped_count) + '건 건너뜀' if skipped_count else ''}"
+    )
+    if errors:
+        message = f"{message} | 오류 {len(errors)}건: {errors[0]}"
+
+    return {
+        "saved": saved_count > 0 and not errors,
+        "saved_count": saved_count,
+        "skipped_count": skipped_count,
+        "errors": errors,
+        "message": message,
+    }
+
+
 def fetch_dead_letters(limit: int = 200) -> list[dict[str, Any]]:
     client = get_cached_supabase_client()
     if client is None:
