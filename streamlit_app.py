@@ -13,6 +13,7 @@ from weviko_factory import run_factory
 from streamlit_services import (
     approve_pending_item,
     assess_analysis_quality,
+    enqueue_pending_vision_result,
     fetch_dead_letters,
     fetch_parts_count,
     fetch_parts_export,
@@ -61,7 +62,9 @@ FACTORY_SCHEMA_OPTIONS = {
     "정비 지침서 (/shop/manual/)": {"schema_key": "path_manual", "path_hint": "/shop/manual/"},
     "부품 제원/호환성 (/item/detail/)": {"schema_key": "path_detail", "path_hint": "/item/detail/"},
     "차체매뉴얼 (/body/manual/)": {"schema_key": "path_body_manual", "path_hint": "/body/manual/"},
+    "회로도/배선도 (/contents/etc/)": {"schema_key": "path_wiring", "path_hint": "/contents/etc/"},
     "와이어링 커넥터 (/wiring/connector/)": {"schema_key": "path_connector", "path_hint": "/wiring/connector/"},
+    "고장 코드(DTC) (/dtc/)": {"schema_key": "path_dtc", "path_hint": "/dtc/"},
     "포럼/실전 팁 (/community/)": {"schema_key": "path_community", "path_hint": "/community/"},
 }
 
@@ -180,6 +183,10 @@ def init_state() -> None:
         st.session_state["logged_in"] = False
     if "active_section" not in st.session_state:
         st.session_state["active_section"] = "데이터 수집"
+    if "active_pipeline_mode" not in st.session_state:
+        st.session_state["active_pipeline_mode"] = PIPELINE_MODES[0]
+    if "active_management_mode" not in st.session_state:
+        st.session_state["active_management_mode"] = MANAGEMENT_MODES[0]
     if "prompt_values" not in st.session_state:
         prompt_values, source = load_config_prompts(DEFAULT_PROMPTS)
         st.session_state["prompt_values"] = prompt_values
@@ -190,6 +197,8 @@ def init_state() -> None:
         st.session_state["last_vision_result"] = None
     if "last_vision_context" not in st.session_state:
         st.session_state["last_vision_context"] = None
+    if "last_vision_queue_result" not in st.session_state:
+        st.session_state["last_vision_queue_result"] = None
     if "last_translation_results" not in st.session_state:
         st.session_state["last_translation_results"] = {}
     if "last_factory_result" not in st.session_state:
@@ -353,17 +362,38 @@ def resolve_path_selection(selected_label: str, direct_path: str) -> tuple[str, 
     return WEVIKO_PATH_MAP[selected_label], raw_path
 
 
+def navigate_to_mode(section: str, mode: str) -> None:
+    st.session_state["active_section"] = section
+    if section == "데이터 수집":
+        st.session_state["active_pipeline_mode"] = mode
+    else:
+        st.session_state["active_management_mode"] = mode
+    st.rerun()
+
+
 def render_sidebar() -> str:
     with st.sidebar:
         st.title("🌍 Weviko OS v5.0")
         st.caption("Global Automotive Data Pipeline")
-        section = st.radio("작업 영역", ["데이터 수집", "데이터 관리/제어"])
+        section_options = ["데이터 수집", "데이터 관리/제어"]
+        current_section = st.session_state.get("active_section", section_options[0])
+        if current_section not in section_options:
+            current_section = section_options[0]
+        section = st.radio("작업 영역", section_options, index=section_options.index(current_section))
         st.session_state["active_section"] = section
         st.divider()
         if section == "데이터 수집":
-            mode = st.radio("데이터 수집 파이프라인", PIPELINE_MODES)
+            current_mode = st.session_state.get("active_pipeline_mode", PIPELINE_MODES[0])
+            if current_mode not in PIPELINE_MODES:
+                current_mode = PIPELINE_MODES[0]
+            mode = st.radio("데이터 수집 파이프라인", PIPELINE_MODES, index=PIPELINE_MODES.index(current_mode))
+            st.session_state["active_pipeline_mode"] = mode
         else:
-            mode = st.radio("데이터 관리 및 제어", MANAGEMENT_MODES)
+            current_mode = st.session_state.get("active_management_mode", MANAGEMENT_MODES[0])
+            if current_mode not in MANAGEMENT_MODES:
+                current_mode = MANAGEMENT_MODES[0]
+            mode = st.radio("데이터 관리 및 제어", MANAGEMENT_MODES, index=MANAGEMENT_MODES.index(current_mode))
+            st.session_state["active_management_mode"] = mode
         st.divider()
         if st.button("🔌 로그아웃", use_container_width=True):
             st.session_state["logged_in"] = False
@@ -456,6 +486,7 @@ def render_vision_input_mode() -> None:
 
         analysis_result = assess_analysis_quality(analysis_result)
         st.session_state["last_vision_result"] = analysis_result
+        st.session_state["last_vision_queue_result"] = queue_result
         st.session_state["last_vision_context"] = {
             "operator_identifier": operator_identifier,
             "part_number_hint": part_clean,
@@ -516,11 +547,40 @@ def render_vision_input_mode() -> None:
                         oem_brand=last_result.get("oem_brand", ""),
                     )
                 st.session_state["last_vision_result"] = refined_result
+                st.session_state["last_vision_queue_result"] = refine_save_result
                 if refine_save_result.get("saved"):
                     st.success("✅ 재정리된 JSON을 새 검수 대기 항목으로 저장했습니다.")
                 else:
                     st.warning(refine_save_result.get("message", "재정리 결과 저장에 실패했습니다."))
                 st.rerun()
+
+        queue_result = st.session_state.get("last_vision_queue_result") or {}
+        action_col1, action_col2, action_col3 = st.columns(3)
+        if queue_result.get("saved"):
+            action_col1.success("검수 대기열 저장 완료")
+        else:
+            context = st.session_state.get("last_vision_context") or {}
+            if action_col1.button("📥 현재 JSON을 검수 대기열로 저장", use_container_width=True):
+                manual_save_result = enqueue_pending_vision_result(
+                    part_number=context.get("part_number_hint", last_result.get("part_number", "")),
+                    oem_brand=last_result.get("oem_brand", ""),
+                    schema_key=context.get("schema_key", last_result.get("schema_key", "")),
+                    source_path_hint=context.get("path_hint", last_result.get("source_path_hint", "")),
+                    market=context.get("market", last_result.get("market", "GLOBAL")),
+                    document_type=context.get("document_type", last_result.get("document_type", "")),
+                    analysis_payload=last_result,
+                    source_type="vision_manual_upload",
+                )
+                st.session_state["last_vision_queue_result"] = manual_save_result
+                if manual_save_result.get("saved"):
+                    st.success("✅ 현재 JSON을 검수 대기열로 저장했습니다.")
+                else:
+                    st.warning(manual_save_result.get("message", "검수 대기열 저장에 실패했습니다."))
+                st.rerun()
+        if action_col2.button("🕵️ 데이터 검수소로 이동", use_container_width=True):
+            navigate_to_mode("데이터 관리/제어", "🕵️ 데이터 검수소 (H-i-t-L)")
+        if action_col3.button("📊 통합 현황/백업 열기", use_container_width=True):
+            navigate_to_mode("데이터 관리/제어", "📊 통합 현황 및 백업")
 
 
 def render_factory_mode() -> None:
@@ -600,6 +660,7 @@ def render_factory_mode() -> None:
                 destination=destination,
                 source_path_hint=path_hint,
                 document_type=selected_schema_label,
+                source_url=start_url.strip(),
             )
 
             st.session_state["last_factory_result"] = {
@@ -626,6 +687,11 @@ def render_factory_mode() -> None:
             )
             st.caption(save_result.get("message", ""))
             st.json(payload)
+            action_col1, action_col2 = st.columns(2)
+            if action_col1.button("🕵️ 검수 대기열/데이터 검수소로 이동", use_container_width=True):
+                navigate_to_mode("데이터 관리/제어", "🕵️ 데이터 검수소 (H-i-t-L)")
+            if action_col2.button("📊 통합 현황/백업 열기", use_container_width=True):
+                navigate_to_mode("데이터 관리/제어", "📊 통합 현황 및 백업")
             return
 
         progress_box = st.empty()
@@ -700,6 +766,11 @@ def render_factory_mode() -> None:
 
         if run_result.rows:
             st.dataframe(pd.DataFrame(run_result.rows), use_container_width=True, hide_index=True)
+        action_col1, action_col2 = st.columns(2)
+        if action_col1.button("🕵️ 데이터 검수소로 이동", use_container_width=True):
+            navigate_to_mode("데이터 관리/제어", "🕵️ 데이터 검수소 (H-i-t-L)")
+        if action_col2.button("📊 통합 현황/백업 열기", use_container_width=True):
+            navigate_to_mode("데이터 관리/제어", "📊 통합 현황 및 백업")
 
 
 def render_review_mode() -> None:

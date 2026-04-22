@@ -507,6 +507,47 @@ def _string_list(value: Any) -> list[str]:
     return []
 
 
+STRUCTURED_CONTENT_KEYS = {
+    "extracted_facts",
+    "vehicle_identifier_facts",
+    "identification_points",
+    "required_tools",
+    "procedure_steps",
+    "related_fasteners",
+    "connector",
+    "pin_map",
+    "diagnostic_steps",
+    "diagnostic_triggers",
+    "diagnostic_results",
+    "wiring_points",
+    "compatibility",
+    "specifications",
+}
+
+
+def _has_meaningful_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, list):
+        return any(_has_meaningful_value(item) for item in value)
+    if isinstance(value, dict):
+        return any(_has_meaningful_value(item) for item in value.values())
+    return True
+
+
+def has_meaningful_structured_content(payload: dict[str, Any]) -> bool:
+    for key in STRUCTURED_CONTENT_KEYS:
+        if _has_meaningful_value(payload.get(key)):
+            return True
+    return False
+
+
 def assess_analysis_quality(payload: dict[str, Any]) -> dict[str, Any]:
     schema_key = str(payload.get("schema_key", "") or "")
     part_number = str(payload.get("part_number", "") or "").strip()
@@ -519,16 +560,34 @@ def assess_analysis_quality(payload: dict[str, Any]) -> dict[str, Any]:
         reasons.append("raw_response_only")
     if not isinstance(extracted_facts, dict) or not extracted_facts:
         reasons.append("empty_extracted_facts")
+    if not has_meaningful_structured_content(payload):
+        reasons.append("empty_structured_content")
     if not summary:
         reasons.append("missing_summary")
     if schema_requires_part_number(schema_key) and is_placeholder_identifier(part_number):
         reasons.append("placeholder_part_number")
 
-    quality_status = "low" if raw_response or len(reasons) >= 2 else "ok"
+    quality_status = "low" if raw_response or "empty_structured_content" in reasons or len(reasons) >= 2 else "ok"
     payload["quality_status"] = quality_status
     payload["quality_reasons"] = reasons
     payload["needs_refinement"] = quality_status == "low"
     return payload
+
+
+def resolve_storage_part_number(
+    schema_key: str,
+    raw_part_number: Any,
+    *,
+    fallback_part_number: str = "",
+) -> str:
+    cleaned_part_number = str(raw_part_number or "").strip()
+    cleaned_fallback = str(fallback_part_number or "").strip()
+
+    if cleaned_part_number and not is_placeholder_identifier(cleaned_part_number):
+        return cleaned_part_number
+    if schema_requires_part_number(schema_key):
+        return cleaned_fallback or "UNKNOWN_PART"
+    return "UNKNOWN"
 
 
 def refine_vision_result_and_save(
@@ -928,6 +987,7 @@ def process_scraped_text_and_save(
     part_number_hint: str = "",
     source_path_hint: str = "",
     document_type: str = "",
+    source_url: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     llm = get_cached_llm()
     client = get_cached_supabase_client()
@@ -952,15 +1012,25 @@ def process_scraped_text_and_save(
         response = invoke_llm_with_fallback([msg])
         raw_text = _extract_response_text(getattr(response, "content", response))
         payload = _parse_json_text(raw_text)
-        payload.setdefault("part_number", part_number_hint or "UNKNOWN_PART")
+        payload["part_number"] = resolve_storage_part_number(
+            doc_type_key,
+            payload.get("part_number"),
+            fallback_part_number=part_number_hint,
+        )
         payload.setdefault("source_path_hint", source_path_hint)
         payload.setdefault("schema_key", doc_type_key)
         payload.setdefault("market", market)
         payload["scraped_at"] = datetime.now().isoformat(timespec="seconds")
+        assess_analysis_quality(payload)
     except Exception as exc:
         return {}, {"saved": False, "message": f"Gemini 분석 실패: {exc}"}
 
-    temp_part_number = str(payload.get("part_number") or part_number_hint or "UNKNOWN_PART").strip()
+    temp_part_number = resolve_storage_part_number(
+        doc_type_key,
+        payload.get("part_number"),
+        fallback_part_number=part_number_hint,
+    )
+    payload["part_number"] = temp_part_number
 
     if destination == "parts":
         save_result = save_crawled_data(
@@ -973,6 +1043,20 @@ def process_scraped_text_and_save(
             document_type=document_type or doc_type_key,
         )
         return payload, save_result
+
+    gsw_result = save_gsw_document(
+        payload,
+        source_type=doc_type_key,
+        status="pending",
+        source_url=source_url,
+        fallback_schema_key=doc_type_key,
+        fallback_document_type=document_type or doc_type_key,
+        fallback_source_path_hint=source_path_hint,
+        fallback_market=market,
+        fallback_part_number=temp_part_number,
+    )
+    if not gsw_result["saved"]:
+        return payload, {"saved": False, "message": gsw_result["message"]}
 
     try:
         client.table(pending_table_name()).insert(
@@ -991,7 +1075,7 @@ def process_scraped_text_and_save(
         return payload, {
             "saved": True,
             "destination": "Pending",
-            "message": "수집 결과를 검수 대기열에 저장했습니다.",
+            "message": "수집 결과를 gsw_documents와 검수 대기열에 저장했습니다.",
         }
     except Exception as exc:
         return payload, {"saved": False, "destination": "none", "message": f"저장 실패: {exc}"}
@@ -1397,6 +1481,31 @@ def save_crawled_data(
             "message": "Supabase가 설정되지 않아 크롤링 결과를 저장할 수 없습니다.",
         }
 
+    resolved_part_number = resolve_storage_part_number(
+        schema_key,
+        raw_json.get("part_number") or part_number,
+        fallback_part_number=part_number,
+    )
+    raw_json["part_number"] = resolved_part_number
+
+    gsw_result = save_gsw_document(
+        raw_json,
+        source_type=source_type,
+        status="crawled",
+        source_url=str(raw_json.get("final_url") or raw_json.get("source_url") or raw_json.get("url") or "").strip(),
+        fallback_schema_key=schema_key,
+        fallback_document_type=document_type,
+        fallback_source_path_hint=source_path_hint,
+        fallback_market=market,
+        fallback_part_number=resolved_part_number,
+    )
+    if not gsw_result["saved"]:
+        return {
+            "saved": False,
+            "destination": "none",
+            "message": gsw_result["message"],
+        }
+
     confidence_threshold = get_config_int_value("confidence_threshold", 90)
     score = raw_json.get("confidence_score", 0)
     try:
@@ -1407,10 +1516,32 @@ def save_crawled_data(
     timestamp = _utc_now_iso()
 
     try:
+        if not schema_requires_part_number(schema_key):
+            client.table(pending_table_name()).insert(
+                {
+                    "part_number": resolved_part_number,
+                    "market": market,
+                    "schema_key": schema_key,
+                    "source_path_hint": source_path_hint,
+                    "document_type": document_type,
+                    "source_type": source_type,
+                    "raw_json": raw_json,
+                    "status": "pending",
+                    "created_at": timestamp,
+                }
+            ).execute()
+            return {
+                "saved": True,
+                "destination": "Pending",
+                "confidence_score": score_value,
+                "confidence_threshold": confidence_threshold,
+                "message": "문서형 크롤링 결과라서 gsw_documents와 검수 대기열에 저장했습니다.",
+            }
+
         if score_value >= confidence_threshold:
             client.table(parts_table_name()).upsert(
                 {
-                    "part_number": part_number,
+                    "part_number": resolved_part_number,
                     "market": market,
                     "schema_key": schema_key,
                     "source_path_hint": source_path_hint,
@@ -1432,7 +1563,7 @@ def save_crawled_data(
 
         client.table(pending_table_name()).insert(
             {
-                "part_number": part_number,
+                "part_number": resolved_part_number,
                 "market": market,
                 "schema_key": schema_key,
                 "source_path_hint": source_path_hint,
@@ -1488,13 +1619,18 @@ def persist_factory_rows(
         route_status = row.get("route_status", "")
         extracted_facts = row.get("extracted_facts") or {}
         part_number = (row.get("part_number") or "").strip()
-        identifier = part_number or row.get("final_url") or row.get("url") or "Unknown"
+        identifier = resolve_storage_part_number(
+            schema_key,
+            part_number,
+            fallback_part_number=row.get("final_url") or row.get("url") or "Unknown",
+        )
 
         if route_status != "content_page" and not extracted_facts:
             skipped_count += 1
             continue
 
         payload = {
+            "part_number": identifier,
             "source_url": row.get("url", ""),
             "final_url": row.get("final_url", ""),
             "http_status": row.get("http_status"),
@@ -1504,6 +1640,7 @@ def persist_factory_rows(
             "compressed_chars": row.get("compressed_chars", 0),
             "extracted_facts": extracted_facts,
         }
+        assess_analysis_quality(payload)
 
         try:
             if destination == "parts":
@@ -1523,6 +1660,19 @@ def persist_factory_rows(
                 elif save_result["destination"] == "Pending":
                     pending_count += 1
             else:
+                gsw_result = save_gsw_document(
+                    payload,
+                    source_type=source_type,
+                    status="pending",
+                    source_url=str(row.get("final_url") or row.get("url") or "").strip(),
+                    fallback_schema_key=schema_key,
+                    fallback_document_type=document_type,
+                    fallback_source_path_hint=source_path_hint,
+                    fallback_market=market,
+                    fallback_part_number=identifier,
+                )
+                if not gsw_result["saved"]:
+                    raise RuntimeError(gsw_result["message"])
                 client.table(pending_table_name()).insert(
                     {
                         "part_number": identifier,
