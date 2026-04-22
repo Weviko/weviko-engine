@@ -9,18 +9,22 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
+from streamlit_services import (
+    analyze_uploaded_image,
+    llm_available,
+    load_prompt_templates,
+    persist_review_decision,
+    reset_prompt_templates,
+    save_prompt_template,
+    supabase_available,
+    translate_record,
+)
 from weviko_factory import run_factory
 
 
 load_dotenv()
 
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "weviko1234!")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip() or os.getenv("GEMINI_API_KEY", "").strip()
-SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL", "").strip()
-SUPABASE_KEY = (
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-    or os.getenv("SUPABASE_SECRET_KEY", "").strip()
-)
 
 MODE_SECTIONS = {
     "🛠️ Data Collection": [
@@ -41,11 +45,13 @@ MODE_SECTIONS = {
 
 DEFAULT_PROMPTS = {
     "도해도 팩트 추출 프롬프트": (
-        "당신은 자동차 데이터 분석가입니다. 스크린샷과 정비 도해도에서 수치화 가능한 팩트만 추출하고, "
-        "저작권 보호를 위해 원문 장문을 그대로 복원하지 마세요."
+        "당신은 자동차 데이터 분석가입니다. 정비 도해도, 회로도, 체결 토크 표, "
+        "서비스 매뉴얼 화면에서 수치화 가능한 팩트만 추출하고, "
+        "저작권 보호를 위해 장문 원문을 재구성하지 마세요."
     ),
     "이커머스 호환성 파싱 프롬프트": (
-        "자동차 부품 페이지에서 부품번호, 차종, 연식, 호환 조건, 수치 스펙을 추출해 JSON으로 정리하세요."
+        "자동차 부품 데이터에서 부품번호, 호환 차종, 연식, 규격, 토크, 중량, "
+        "장착 조건을 추출하고 다국어 JSON으로 정리하세요."
     ),
 }
 
@@ -64,8 +70,16 @@ def init_state() -> None:
         st.session_state["last_run_result"] = None
     if "review_states" not in st.session_state:
         st.session_state["review_states"] = {}
+    if "translation_results" not in st.session_state:
+        st.session_state["translation_results"] = {}
+    if "last_vision_result" not in st.session_state:
+        st.session_state["last_vision_result"] = None
     if "prompt_templates" not in st.session_state:
-        st.session_state["prompt_templates"] = dict(DEFAULT_PROMPTS)
+        prompts, source = load_prompt_templates(DEFAULT_PROMPTS)
+        st.session_state["prompt_templates"] = prompts
+        st.session_state["prompt_source"] = source
+    if "prompt_source" not in st.session_state:
+        st.session_state["prompt_source"] = "defaults"
 
 
 def inject_styles() -> None:
@@ -197,16 +211,21 @@ def render_hero() -> None:
 
 
 def render_system_status() -> None:
-    llm_badge = "Gemini 연결됨" if GOOGLE_API_KEY else "Gemini 미설정"
-    db_badge = "Supabase 연결됨" if SUPABASE_URL and SUPABASE_KEY else "Supabase 미설정"
-    render_mode = "Docker / Streamlit Web Service"
+    llm_badge = "Gemini 연결됨" if llm_available() else "Gemini 미설정"
+    db_badge = "Supabase 연결됨" if supabase_available() else "Supabase 미설정"
+    prompt_badge = {
+        "supabase": "프롬프트 저장: Supabase",
+        "local_file": "프롬프트 저장: 로컬 파일",
+        "defaults": "프롬프트 저장: 기본값",
+    }.get(st.session_state.get("prompt_source", "defaults"), "프롬프트 저장: 기본값")
 
     st.markdown(
         f"""
         <div class="weviko-panel">
             <span class="weviko-status">🧠 {llm_badge}</span>
             <span class="weviko-status">🗄️ {db_badge}</span>
-            <span class="weviko-status">🚀 {render_mode}</span>
+            <span class="weviko-status">💾 {prompt_badge}</span>
+            <span class="weviko-status">🚀 Docker / Streamlit Web Service</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -266,6 +285,10 @@ def get_last_rows() -> list[dict]:
 def get_last_df() -> pd.DataFrame:
     rows = get_last_rows()
     return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+def get_content_rows() -> list[dict]:
+    return [row for row in get_last_rows() if row.get("route_status") == "content_page"]
 
 
 def store_result(result) -> None:
@@ -427,15 +450,21 @@ def render_single_target_mode() -> None:
 
 def render_vision_mode() -> None:
     st.title("📷 수동 캡처(Vision) 데이터 세탁소")
-    st.info("GSW, 도해도, 토크 표처럼 크롤링 대신 수동 캡처가 필요한 화면을 후처리하는 공간입니다.")
+    st.info("GSW, 도해도, 토크 표처럼 크롤링 대신 수동 캡처가 필요한 화면을 Gemini Vision으로 구조화합니다.")
 
     col1, col2 = st.columns(2)
     with col1:
         part_number = st.text_input("부품 번호 (선택)")
     with col2:
-        doc_type = st.selectbox("문서 종류", ["정비/조립 순서", "회로도/배선", "체결 토크 표"])
+        document_type = st.selectbox("문서 종류", ["정비/조립 순서", "회로도/배선", "체결 토크 표"])
 
+    prompt_text = st.text_area(
+        "Vision 분석 프롬프트",
+        value=st.session_state["prompt_templates"]["도해도 팩트 추출 프롬프트"],
+        height=120,
+    )
     uploaded_file = st.file_uploader("스크린샷 업로드", type=["png", "jpg", "jpeg", "webp"])
+
     if uploaded_file is not None:
         st.image(uploaded_file, caption="업로드 미리보기", use_container_width=True)
 
@@ -443,20 +472,29 @@ def render_vision_mode() -> None:
         if uploaded_file is None:
             st.warning("먼저 이미지를 업로드해 주세요.")
             return
-        if not GOOGLE_API_KEY:
-            st.warning("현재 GOOGLE_API_KEY가 없어 실제 Gemini Vision 호출 대신 예시 결과를 표시합니다.")
 
-        preview = {
-            "part_number": part_number or "UNKNOWN",
-            "document_type": doc_type,
-            "extracted_facts": {
-                "torque_nm": "25~30",
-                "steps": ["배터리 탈거", "브래킷 고정 볼트 해제"],
-            },
-            "captured_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        st.success("분석 요청 형식 준비 완료")
-        st.code(json.dumps(preview, ensure_ascii=False, indent=2), language="json")
+        with st.spinner("Gemini Vision이 이미지에서 팩트 데이터를 추출하는 중입니다..."):
+            result, storage = analyze_uploaded_image(
+                file_bytes=uploaded_file.getvalue(),
+                mime_type=uploaded_file.type or "image/png",
+                part_number=part_number.strip(),
+                document_type=document_type,
+                prompt_text=prompt_text,
+            )
+        st.session_state["last_vision_result"] = result
+
+        if result.get("analysis_mode") == "gemini":
+            st.success("Vision 분석이 완료되었습니다.")
+        else:
+            st.warning("Gemini 설정이 없어 예시 기반 폴백 결과를 표시합니다.")
+        st.caption(storage["message"])
+
+    if st.session_state.get("last_vision_result"):
+        st.subheader("Vision 결과")
+        st.code(
+            json.dumps(st.session_state["last_vision_result"], ensure_ascii=False, indent=2),
+            language="json",
+        )
 
 
 def render_factory_mode() -> None:
@@ -498,62 +536,110 @@ def render_review_mode() -> None:
     st.title("🕵️ 데이터 검수소 (H-i-t-L)")
     st.markdown("AI가 수집한 결과를 사람이 마지막으로 승인하거나 보류합니다.")
 
-    df = get_last_df()
-    if df.empty:
+    content_rows = get_content_rows()
+    if not content_rows:
         st.info("아직 검수할 수집 결과가 없습니다. 먼저 단일 테스트나 대규모 팩토리를 실행해 주세요.")
         return
 
-    content_df = df[df["route_status"] == "content_page"].copy() if "route_status" in df.columns else df
-    if content_df.empty:
-        st.info("현재 검수 가능한 본문 페이지 결과가 없습니다.")
-        return
-
-    selected_url = st.selectbox("검수 대상 URL", content_df["url"].tolist())
-    record = content_df[content_df["url"] == selected_url].iloc[0].to_dict()
+    by_url = {row["url"]: row for row in content_rows}
+    selected_url = st.selectbox("검수 대상 URL", list(by_url.keys()))
+    record = by_url[selected_url]
     current_state = st.session_state["review_states"].get(selected_url, "대기")
-
+    notes = st.text_input("검수 메모", key=f"review-note-{selected_url}")
+    edited_json = st.text_area(
+        "AI 추출 결과 편집",
+        value=json.dumps(record, ensure_ascii=False, indent=2),
+        height=280,
+        key=f"review-json-{selected_url}",
+    )
     st.caption(f"현재 상태: {current_state}")
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        st.text_area(
-            "AI 추출 결과",
-            value=json.dumps(record, ensure_ascii=False, indent=2),
-            height=260,
+
+    col1, col2, col3 = st.columns(3)
+    approve_clicked = col1.button("✅ 승인 (DB 이관)", type="primary", use_container_width=True)
+    edit_approve_clicked = col2.button("✏️ 수정 후 승인", use_container_width=True)
+    discard_clicked = col3.button("🗑️ 영구 폐기", type="secondary", use_container_width=True)
+
+    action = None
+    if approve_clicked:
+        action = "approved"
+    elif edit_approve_clicked:
+        action = "edited_approved"
+    elif discard_clicked:
+        action = "discarded"
+
+    if action is not None:
+        try:
+            reviewed_record = json.loads(edited_json)
+            if not isinstance(reviewed_record, dict):
+                raise ValueError("JSON 객체 형태여야 합니다.")
+        except Exception as exc:
+            st.error(f"편집된 JSON을 읽을 수 없습니다: {exc}")
+            return
+
+        persistence = persist_review_decision(
+            original_record=record,
+            reviewed_record=reviewed_record,
+            decision=action,
+            notes=notes,
         )
-    with col2:
-        if st.button("✅ 승인 (DB 이관)", type="primary", use_container_width=True):
-            st.session_state["review_states"][selected_url] = "승인됨"
-            st.rerun()
-        if st.button("✏️ 수정 후 승인", use_container_width=True):
-            st.session_state["review_states"][selected_url] = "수정 승인"
-            st.rerun()
-        if st.button("🗑️ 영구 폐기", type="secondary", use_container_width=True):
-            st.session_state["review_states"][selected_url] = "폐기됨"
-            st.rerun()
+        label_map = {
+            "approved": "승인됨",
+            "edited_approved": "수정 승인",
+            "discarded": "폐기됨",
+        }
+        st.session_state["review_states"][selected_url] = label_map[action]
+        st.success(f"검수 상태가 `{label_map[action]}`으로 업데이트되었습니다.")
+        st.caption(persistence["review_message"])
+        st.caption(persistence["parts_message"])
 
 
 def render_translation_mode() -> None:
     st.title("🌐 다국어 번역 엔진")
-    st.info("수집 결과를 한국어, 영어, 베트남어용 구조화 데이터로 확장하는 운영 패널입니다.")
+    st.info("수집된 구조화 데이터를 한국어, 영어, 베트남어 JSON으로 번역하고 선택적으로 Supabase에 저장합니다.")
 
-    rows = get_last_rows()
-    ready_count = len(rows)
-    st.write(f"현재 번역 대기 데이터: **{ready_count}건**")
-    if st.button("🌍 전체 자동 번역 가동", type="primary", use_container_width=True):
-        if ready_count == 0:
-            st.warning("먼저 수집 결과를 하나 이상 만들어 주세요.")
-        elif not GOOGLE_API_KEY:
-            st.warning("GOOGLE_API_KEY가 없어 실제 번역 호출 대신 미리보기만 제공합니다.")
-        else:
-            st.success(f"{ready_count}건 번역 작업을 큐에 올릴 준비가 되었습니다.")
+    content_rows = get_content_rows()
+    if not content_rows:
+        st.info("번역할 수집 결과가 없습니다. 먼저 크롤링 결과를 만들어 주세요.")
+        return
 
-    preview = {
-        "ko": {"step_1": "브레이크 캘리퍼 볼트를 풉니다."},
-        "en": {"step_1": "Loosen the brake caliper bolts."},
-        "vn": {"step_1": "Nới lỏng các bu lông ngàm phanh."},
-    }
-    st.subheader("번역 결과 미리보기")
-    st.json(preview)
+    prompt_text = st.text_area(
+        "번역 프롬프트",
+        value=st.session_state["prompt_templates"]["이커머스 호환성 파싱 프롬프트"],
+        height=120,
+    )
+    mode = st.radio("번역 범위", ["단일 항목", "여러 항목"], horizontal=True)
+
+    urls = [row["url"] for row in content_rows]
+    if mode == "단일 항목":
+        selected_urls = [st.selectbox("번역 대상 URL", urls)]
+    else:
+        selected_urls = st.multiselect("번역 대상 URL", urls, default=urls[: min(3, len(urls))])
+
+    if st.button("🌍 번역 실행", type="primary", use_container_width=True):
+        if not selected_urls:
+            st.warning("번역할 항목을 하나 이상 선택해 주세요.")
+            return
+
+        lookup = {row["url"]: row for row in content_rows}
+        progress = st.progress(0, text="번역 준비 중...")
+        completed = 0
+        for url in selected_urls:
+            record = lookup[url]
+            translation, storage = translate_record(record=record, prompt_text=prompt_text)
+            st.session_state["translation_results"][url] = translation
+            completed += 1
+            progress.progress(int(completed / len(selected_urls) * 100), text=f"번역 중... ({completed}/{len(selected_urls)})")
+            st.caption(f"{url} -> {storage['message']}")
+        progress.progress(100, text="번역 완료")
+        st.success(f"{len(selected_urls)}건 번역을 완료했습니다.")
+
+    if st.session_state["translation_results"]:
+        preview_url = st.selectbox(
+            "번역 결과 미리보기",
+            list(st.session_state["translation_results"].keys()),
+            key="translation-preview",
+        )
+        st.json(st.session_state["translation_results"][preview_url])
 
 
 def render_prompt_mode() -> None:
@@ -562,11 +648,23 @@ def render_prompt_mode() -> None:
     new_text = st.text_area(
         "시스템 지시문",
         value=st.session_state["prompt_templates"][prompt_name],
-        height=220,
+        height=240,
     )
-    if st.button("💾 프롬프트 업데이트", type="primary"):
+
+    col1, col2 = st.columns(2)
+    if col1.button("💾 프롬프트 업데이트", type="primary", use_container_width=True):
+        result = save_prompt_template(prompt_name, new_text)
         st.session_state["prompt_templates"][prompt_name] = new_text
-        st.success("프롬프트가 세션에 저장되었습니다. 다음 실행부터 이 값을 기준으로 운영할 수 있습니다.")
+        st.session_state["prompt_source"] = result["source"]
+        st.success(result["message"])
+
+    if col2.button("↺ 기본 프롬프트 복원", use_container_width=True):
+        result = reset_prompt_templates(DEFAULT_PROMPTS)
+        st.session_state["prompt_templates"] = dict(DEFAULT_PROMPTS)
+        st.session_state["prompt_source"] = result["source"]
+        st.success(result["message"])
+
+    st.caption(f"현재 저장 소스: {st.session_state.get('prompt_source', 'defaults')}")
 
 
 def render_error_hospital() -> None:
@@ -600,18 +698,22 @@ def render_analytics_mode() -> None:
     df = get_last_df()
     total_rows = len(df)
     content_rows = int((df["route_status"] == "content_page").sum()) if "route_status" in df.columns else 0
-    broken_rows = (
-        int((df["route_status"] == "broken_public_route").sum())
-        if "route_status" in df.columns
-        else 0
-    )
+    broken_rows = int((df["route_status"] == "broken_public_route").sum()) if "route_status" in df.columns else 0
     auth_rows = int((df["route_status"] == "auth_required").sum()) if "route_status" in df.columns else 0
+    translated_rows = len(st.session_state.get("translation_results", {}))
+    reviewed_rows = len(st.session_state.get("review_states", {}))
+    vision_runs = 1 if st.session_state.get("last_vision_result") else 0
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("총 수집 결과", f"{total_rows:,}")
     c2.metric("정상 콘텐츠 페이지", f"{content_rows:,}")
     c3.metric("깨진 공개 경로", f"{broken_rows:,}")
     c4.metric("로그인 필요 경로", f"{auth_rows:,}")
+
+    c5, c6, c7 = st.columns(3)
+    c5.metric("번역 완료 항목", f"{translated_rows:,}")
+    c6.metric("검수 처리 항목", f"{reviewed_rows:,}")
+    c7.metric("Vision 분석 실행", f"{vision_runs:,}")
 
     st.divider()
     st.subheader("💾 원클릭 데이터 추출 (CSV)")
