@@ -134,6 +134,73 @@ create table if not exists public.part_translations (
 create index if not exists idx_part_translations_part_number on public.part_translations (part_number);
 create index if not exists idx_part_translations_created_at on public.part_translations (created_at desc);
 
+-- 3e. GSW document master
+create table if not exists public.gsw_documents (
+  id uuid primary key default gen_random_uuid(),
+  source_fingerprint text unique not null,
+  source_system text not null default 'hyundai_gsw',
+  part_number text,
+  oem_brand text,
+  brand text,
+  market text,
+  vehicle_model text,
+  vehicle_year text,
+  vehicle_trim text,
+  engine_code text,
+  transmission_code text,
+  menu_family text,
+  schema_key text,
+  document_type text,
+  title text,
+  breadcrumb_text text,
+  breadcrumb_path jsonb not null default '[]'::jsonb,
+  source_url text,
+  source_path_hint text,
+  capture_type text,
+  source_type text,
+  page_ref text,
+  summary text,
+  document_payload jsonb not null default '{}'::jsonb,
+  status text not null default 'approved',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.gsw_documents add column if not exists source_fingerprint text;
+alter table public.gsw_documents add column if not exists source_system text;
+alter table public.gsw_documents add column if not exists part_number text;
+alter table public.gsw_documents add column if not exists oem_brand text;
+alter table public.gsw_documents add column if not exists brand text;
+alter table public.gsw_documents add column if not exists market text;
+alter table public.gsw_documents add column if not exists vehicle_model text;
+alter table public.gsw_documents add column if not exists vehicle_year text;
+alter table public.gsw_documents add column if not exists vehicle_trim text;
+alter table public.gsw_documents add column if not exists engine_code text;
+alter table public.gsw_documents add column if not exists transmission_code text;
+alter table public.gsw_documents add column if not exists menu_family text;
+alter table public.gsw_documents add column if not exists schema_key text;
+alter table public.gsw_documents add column if not exists document_type text;
+alter table public.gsw_documents add column if not exists title text;
+alter table public.gsw_documents add column if not exists breadcrumb_text text;
+alter table public.gsw_documents add column if not exists breadcrumb_path jsonb not null default '[]'::jsonb;
+alter table public.gsw_documents add column if not exists source_url text;
+alter table public.gsw_documents add column if not exists source_path_hint text;
+alter table public.gsw_documents add column if not exists capture_type text;
+alter table public.gsw_documents add column if not exists source_type text;
+alter table public.gsw_documents add column if not exists page_ref text;
+alter table public.gsw_documents add column if not exists summary text;
+alter table public.gsw_documents add column if not exists document_payload jsonb not null default '{}'::jsonb;
+alter table public.gsw_documents add column if not exists status text not null default 'approved';
+alter table public.gsw_documents add column if not exists created_at timestamptz not null default now();
+alter table public.gsw_documents add column if not exists updated_at timestamptz not null default now();
+
+create unique index if not exists idx_gsw_documents_source_fingerprint on public.gsw_documents (source_fingerprint);
+create index if not exists idx_gsw_documents_schema_key on public.gsw_documents (schema_key);
+create index if not exists idx_gsw_documents_document_type on public.gsw_documents (document_type);
+create index if not exists idx_gsw_documents_vehicle_model on public.gsw_documents (vehicle_model);
+create index if not exists idx_gsw_documents_status on public.gsw_documents (status);
+create index if not exists idx_gsw_documents_created_at on public.gsw_documents (created_at desc);
+
 -- 4. Crawl/dead-letter error store
 create table if not exists public.dead_letters (
   id uuid primary key default gen_random_uuid(),
@@ -177,8 +244,16 @@ values
     '정비 지침서 성격의 자료입니다. 작업 순서, 공구, 토크, 주의사항, 분해/조립 절차를 구조화하세요.'
   ),
   (
+    'path_body_manual',
+    '차체매뉴얼 자료입니다. 패널명, 탈거/장착 순서, 체결부, 실러/접착, 조정 포인트, 주의사항을 구조화하세요.'
+  ),
+  (
     'path_detail',
     '부품 제원/호환성 페이지입니다. 부품번호, 규격, OEM 정보, 적용 차종, 연식, 호환 조건을 우선 추출하세요.'
+  ),
+  (
+    'path_connector',
+    '와이어링 커넥터 자료입니다. 커넥터명, 위치, 핀 수, 핀맵, 배선색, 신호명, 연결 대상만 구조화하세요.'
   ),
   (
     'path_vehicle_id',

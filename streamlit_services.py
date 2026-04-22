@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -99,6 +100,10 @@ def vision_table_name() -> str:
 
 def parts_table_name() -> str:
     return os.getenv("WEVIKO_PARTS_TABLE", "parts").strip() or "parts"
+
+
+def gsw_documents_table_name() -> str:
+    return os.getenv("WEVIKO_GSW_DOCUMENTS_TABLE", "gsw_documents").strip() or "gsw_documents"
 
 
 def pending_table_name() -> str:
@@ -352,6 +357,18 @@ def _parse_json_text(raw_text: str) -> dict[str, Any]:
     return {"raw_response": loaded}
 
 
+PART_NUMBER_REQUIRED_SCHEMAS = {"path_detail"}
+
+
+def schema_requires_part_number(schema_key: str | None) -> bool:
+    return str(schema_key or "").strip() in PART_NUMBER_REQUIRED_SCHEMAS
+
+
+def is_placeholder_identifier(value: str | None) -> bool:
+    normalized = str(value or "").strip()
+    return normalized in {"", "Unknown", "UNKNOWN", "UNKNOWN_PART", "AI_AUTO_DETECT"}
+
+
 def _extract_vehicle_identifier_examples(raw_text: str) -> dict[str, list[str]]:
     text = raw_text or ""
     upper_text = text.upper()
@@ -369,6 +386,17 @@ def _extract_vehicle_identifier_examples(raw_text: str) -> dict[str, list[str]]:
     }
 
 
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        if ">" in value:
+            return [segment.strip() for segment in value.split(">") if segment.strip()]
+        if value.strip():
+            return [value.strip()]
+    return []
+
+
 def assess_analysis_quality(payload: dict[str, Any]) -> dict[str, Any]:
     schema_key = str(payload.get("schema_key", "") or "")
     part_number = str(payload.get("part_number", "") or "").strip()
@@ -383,7 +411,7 @@ def assess_analysis_quality(payload: dict[str, Any]) -> dict[str, Any]:
         reasons.append("empty_extracted_facts")
     if not summary:
         reasons.append("missing_summary")
-    if schema_key != "path_vehicle_id" and part_number in {"", "Unknown", "UNKNOWN_PART", "AI_AUTO_DETECT"}:
+    if schema_requires_part_number(schema_key) and is_placeholder_identifier(part_number):
         reasons.append("placeholder_part_number")
 
     quality_status = "low" if raw_response or len(reasons) >= 2 else "ok"
@@ -455,8 +483,10 @@ def refine_vision_result_and_save(
 
     refined_payload.setdefault(
         "part_number",
-        "UNKNOWN" if schema_key == "path_vehicle_id" else (part_number_hint or "Unknown"),
+        "UNKNOWN" if not schema_requires_part_number(schema_key) else (part_number_hint or "Unknown"),
     )
+    if not schema_requires_part_number(schema_key) and is_placeholder_identifier(refined_payload.get("part_number")):
+        refined_payload["part_number"] = "UNKNOWN"
     refined_payload.setdefault("oem_brand", oem_brand)
     refined_payload.setdefault("schema_key", schema_key)
     refined_payload.setdefault("source_path_hint", source_path_hint)
@@ -465,6 +495,18 @@ def refine_vision_result_and_save(
     refined_payload["analysis_mode"] = "gemini_refined"
     refined_payload["captured_at"] = datetime.now().isoformat(timespec="seconds")
     assess_analysis_quality(refined_payload)
+
+    save_gsw_document(
+        refined_payload,
+        source_type="vision_refined",
+        status="pending",
+        fallback_schema_key=schema_key,
+        fallback_document_type=document_type,
+        fallback_source_path_hint=source_path_hint,
+        fallback_oem_brand=oem_brand,
+        fallback_market=market,
+        fallback_part_number=part_number_hint,
+    )
 
     _insert_remote(
         vision_table_name(),
@@ -498,6 +540,126 @@ def refine_vision_result_and_save(
         "prompt_key": schema_key,
         "destination": "Pending",
     }
+
+
+def build_gsw_document_record(
+    payload: dict[str, Any],
+    *,
+    source_type: str,
+    status: str,
+    source_url: str = "",
+    fallback_schema_key: str = "",
+    fallback_document_type: str = "",
+    fallback_source_path_hint: str = "",
+    fallback_oem_brand: str = "",
+    fallback_market: str = "GLOBAL",
+    fallback_part_number: str = "",
+) -> dict[str, Any]:
+    schema_key = str(payload.get("schema_key") or fallback_schema_key or "").strip()
+    document_type = str(payload.get("document_type") or fallback_document_type or schema_key or "").strip()
+    source_path_hint = str(payload.get("source_path_hint") or fallback_source_path_hint or "").strip()
+    oem_brand = str(payload.get("oem_brand") or fallback_oem_brand or "Hyundai").strip()
+    market = str(payload.get("market") or fallback_market or "GLOBAL").strip()
+    part_number = str(payload.get("part_number") or fallback_part_number or "UNKNOWN").strip()
+    if not schema_requires_part_number(schema_key) and is_placeholder_identifier(part_number):
+        part_number = "UNKNOWN"
+
+    vehicle = payload.get("vehicle") if isinstance(payload.get("vehicle"), dict) else {}
+    breadcrumb_path = _string_list(payload.get("breadcrumbs") or payload.get("breadcrumb_path") or [])
+    breadcrumb_text = " > ".join(breadcrumb_path)
+    title = str(
+        payload.get("title")
+        or payload.get("page_title")
+        or payload.get("section_title")
+        or payload.get("summary")
+        or document_type
+        or schema_key
+    ).strip()
+    menu_family = str(payload.get("menu_family") or (breadcrumb_path[0] if breadcrumb_path else document_type)).strip()
+    summary = str(payload.get("summary") or "").strip()
+
+    fingerprint_source = {
+        "schema_key": schema_key,
+        "document_type": document_type,
+        "title": title,
+        "breadcrumb_path": breadcrumb_path,
+        "source_path_hint": source_path_hint,
+        "market": market,
+        "part_number": part_number,
+        "source_url": source_url,
+    }
+    source_fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_source, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+    return {
+        "source_fingerprint": source_fingerprint,
+        "source_system": "hyundai_gsw",
+        "part_number": part_number,
+        "oem_brand": oem_brand,
+        "brand": str(vehicle.get("brand") or "Hyundai").strip(),
+        "market": market,
+        "vehicle_model": str(vehicle.get("model") or payload.get("vehicle_model") or payload.get("model") or "").strip(),
+        "vehicle_year": str(vehicle.get("year") or payload.get("year") or "").strip(),
+        "vehicle_trim": str(vehicle.get("trim") or payload.get("vehicle_trim") or "").strip(),
+        "engine_code": str(vehicle.get("engine") or payload.get("engine_code") or "").strip(),
+        "transmission_code": str(vehicle.get("transmission") or payload.get("transmission_code") or "").strip(),
+        "menu_family": menu_family,
+        "schema_key": schema_key,
+        "document_type": document_type,
+        "title": title,
+        "breadcrumb_text": breadcrumb_text,
+        "breadcrumb_path": breadcrumb_path,
+        "source_url": source_url,
+        "source_path_hint": source_path_hint,
+        "capture_type": str(payload.get("capture_type") or source_type).strip(),
+        "source_type": source_type,
+        "page_ref": str(payload.get("page_ref") or payload.get("page_number") or "").strip(),
+        "summary": summary,
+        "document_payload": payload,
+        "status": status,
+        "updated_at": _utc_now_iso(),
+    }
+
+
+def save_gsw_document(
+    payload: dict[str, Any],
+    *,
+    source_type: str,
+    status: str,
+    source_url: str = "",
+    fallback_schema_key: str = "",
+    fallback_document_type: str = "",
+    fallback_source_path_hint: str = "",
+    fallback_oem_brand: str = "",
+    fallback_market: str = "GLOBAL",
+    fallback_part_number: str = "",
+) -> dict[str, Any]:
+    client = get_cached_supabase_client()
+    if client is None:
+        return {"saved": False, "message": "Supabase가 설정되지 않아 gsw_documents 저장을 건너뜁니다."}
+
+    record = build_gsw_document_record(
+        payload,
+        source_type=source_type,
+        status=status,
+        source_url=source_url,
+        fallback_schema_key=fallback_schema_key,
+        fallback_document_type=fallback_document_type,
+        fallback_source_path_hint=fallback_source_path_hint,
+        fallback_oem_brand=fallback_oem_brand,
+        fallback_market=fallback_market,
+        fallback_part_number=fallback_part_number,
+    )
+
+    try:
+        client.table(gsw_documents_table_name()).upsert(
+            _clean_json_value(record),
+            on_conflict="source_fingerprint",
+        ).execute()
+        return {"saved": True, "message": "gsw_documents 마스터에 반영했습니다.", "record": record}
+    except Exception as exc:
+        return {"saved": False, "message": f"gsw_documents 저장 실패: {exc}", "record": record}
 
 
 def process_vision_and_save(
@@ -568,14 +730,21 @@ def process_vision_and_save(
                 "captured_at": datetime.now().isoformat(timespec="seconds"),
             }
 
-    if doc_type_key == "path_vehicle_id" and str(payload.get("part_number", "")).strip() in {
-        "",
-        "Unknown",
-        "UNKNOWN_PART",
-        "AI_AUTO_DETECT",
-    }:
+    if not schema_requires_part_number(doc_type_key) and is_placeholder_identifier(payload.get("part_number")):
         payload["part_number"] = "UNKNOWN"
     assess_analysis_quality(payload)
+
+    save_gsw_document(
+        payload,
+        source_type="vision_capture",
+        status="pending",
+        fallback_schema_key=doc_type_key,
+        fallback_document_type=document_type,
+        fallback_source_path_hint=source_path_hint,
+        fallback_oem_brand=oem_brand,
+        fallback_market=market,
+        fallback_part_number=part_num,
+    )
 
     _insert_remote(
         vision_table_name(),
@@ -933,21 +1102,38 @@ def approve_pending_item(
             or item.get("document_type", "")
         )
         resolved_source_type = edited_payload.get("source_type") or item.get("source_type", "")
+        gsw_result = save_gsw_document(
+            edited_payload,
+            source_type=resolved_source_type or "review_approved",
+            status="approved",
+            fallback_schema_key=resolved_schema_key,
+            fallback_document_type=resolved_document_type,
+            fallback_source_path_hint=resolved_source_path_hint,
+            fallback_oem_brand=resolved_oem_brand,
+            fallback_market=resolved_market,
+            fallback_part_number=resolved_part_number,
+        )
+        if not gsw_result["saved"]:
+            raise RuntimeError(gsw_result["message"])
 
-        client.table(parts_table_name()).upsert(
-            {
-                "part_number": resolved_part_number,
-                "oem_brand": resolved_oem_brand,
-                "schema_key": resolved_schema_key,
-                "source_path_hint": resolved_source_path_hint,
-                "market": resolved_market,
-                "document_type": resolved_document_type,
-                "source_type": resolved_source_type,
-                "spec_data": edited_payload,
-                "updated_at": _utc_now_iso(),
-            },
-            on_conflict="part_number",
-        ).execute()
+        part_saved = False
+        if schema_requires_part_number(resolved_schema_key) and not is_placeholder_identifier(resolved_part_number):
+            client.table(parts_table_name()).upsert(
+                {
+                    "part_number": resolved_part_number,
+                    "oem_brand": resolved_oem_brand,
+                    "schema_key": resolved_schema_key,
+                    "source_path_hint": resolved_source_path_hint,
+                    "market": resolved_market,
+                    "document_type": resolved_document_type,
+                    "source_type": resolved_source_type,
+                    "spec_data": edited_payload,
+                    "updated_at": _utc_now_iso(),
+                },
+                on_conflict="part_number",
+            ).execute()
+            part_saved = True
+
         client.table(pending_table_name()).update(
             {
                 "status": "approved",
@@ -962,9 +1148,19 @@ def approve_pending_item(
                 "source_type": resolved_source_type,
             }
         ).eq("id", item_id).execute()
+
+        message_parts: list[str] = []
+        if gsw_result["saved"]:
+            message_parts.append("gsw_documents 마스터에 반영했습니다.")
+        else:
+            message_parts.append(gsw_result["message"])
+        if part_saved:
+            message_parts.append("parts 테이블에도 반영했습니다.")
+        else:
+            message_parts.append("이번 문서는 GSW 문서형으로 분류되어 parts 업서는 건너뛰었습니다.")
         return {
             "saved": True,
-            "message": "정식 parts 테이블로 이관했고 pending_data 상태를 approved로 갱신했습니다.",
+            "message": " ".join(message_parts),
         }
     except Exception as exc:
         return {

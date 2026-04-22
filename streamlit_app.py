@@ -40,14 +40,18 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "weviko1234!")
 WEVIKO_PATH_MAP = {
     "🛠️ 정비 지침서 (/shop/manual/)": "path_manual",
     "⚙️ 부품 제원/호환성 (/item/detail/)": "path_detail",
+    "🧱 차체매뉴얼 (/body/manual/)": "path_body_manual",
     "⚡ 회로도/배선도 (/contents/etc/)": "path_wiring",
+    "🔌 와이어링 커넥터 (/wiring/connector/)": "path_connector",
     "🗣️ 포럼/실전 팁 (/community/)": "path_community",
     "⚠️ 고장 코드(DTC) (/dtc/)": "path_dtc",
 }
 
 VISION_DOC_TYPE_OPTIONS = {
     "정비 지침/토크": {"schema_key": "path_manual", "path_hint": "/shop/manual/"},
+    "차체매뉴얼": {"schema_key": "path_body_manual", "path_hint": "/body/manual/"},
     "회로도/배선도": {"schema_key": "path_wiring", "path_hint": "/contents/etc/"},
+    "와이어링 커넥터": {"schema_key": "path_connector", "path_hint": "/wiring/connector/"},
     "부품 제원/도해도": {"schema_key": "path_detail", "path_hint": "/item/detail/"},
     "차량 식별/VIN/페인트 코드": {"schema_key": "path_vehicle_id", "path_hint": "/vehicle-id/"},
     "고장 코드 DTC": {"schema_key": "path_dtc", "path_hint": "/dtc/"},
@@ -56,6 +60,8 @@ VISION_DOC_TYPE_OPTIONS = {
 FACTORY_SCHEMA_OPTIONS = {
     "정비 지침서 (/shop/manual/)": {"schema_key": "path_manual", "path_hint": "/shop/manual/"},
     "부품 제원/호환성 (/item/detail/)": {"schema_key": "path_detail", "path_hint": "/item/detail/"},
+    "차체매뉴얼 (/body/manual/)": {"schema_key": "path_body_manual", "path_hint": "/body/manual/"},
+    "와이어링 커넥터 (/wiring/connector/)": {"schema_key": "path_connector", "path_hint": "/wiring/connector/"},
     "포럼/실전 팁 (/community/)": {"schema_key": "path_community", "path_hint": "/community/"},
 }
 
@@ -75,8 +81,14 @@ DEFAULT_PROMPTS = {
     "path_manual": (
         "정비 지침서 성격의 자료입니다. 작업 순서, 공구, 토크, 주의사항, 분해/조립 절차를 구조화하세요."
     ),
+    "path_body_manual": (
+        "차체매뉴얼 자료입니다. 패널명, 탈거/장착 순서, 체결부, 실러/접착, 조정 포인트, 주의사항을 구조화하세요."
+    ),
     "path_detail": (
         "부품 제원/호환성 페이지입니다. 부품번호, 규격, OEM 정보, 적용 차종, 연식, 호환 조건을 우선 추출하세요."
+    ),
+    "path_connector": (
+        "와이어링 커넥터 자료입니다. 커넥터명, 위치, 핀 수, 핀맵, 배선색, 신호명, 연결 대상만 구조화하세요."
     ),
     "path_vehicle_id": (
         "차량 식별/VIN/페인트 코드/엔진 코드 해설 자료입니다. "
@@ -95,6 +107,53 @@ DEFAULT_PROMPTS = {
     "proxy_url": "",
     "custom_user_agent": "",
     "confidence_threshold": "90",
+}
+
+GSW_JSON_TEMPLATES = {
+    "path_vehicle_id": {
+        "title": "식별번호 위치 안내",
+        "document_type": "vehicle_identification_overview",
+        "vehicle": {"brand": "Hyundai", "model": "EQ900", "year": 2019, "engine": "G 3.3 T-GDI"},
+        "breadcrumbs": ["엔진", "G 3.3 T-GDI", "일반사항", "식별번호", "일반사항"],
+        "summary": "차대번호, 엔진번호, 자동변속기번호 등 차량 식별 포인트 안내",
+        "vehicle_identifier_facts": {
+            "vin_examples": [],
+            "paint_code_examples": [],
+            "engine_or_code_examples": [],
+            "serial_or_label_examples": [],
+        },
+        "identification_points": [
+            {"item": "vin", "label": "차대번호", "location_description": ""},
+            {"item": "engine_number", "label": "엔진번호", "location_description": ""},
+            {"item": "transmission_number", "label": "자동변속기번호", "location_description": ""},
+        ],
+        "cautions": [],
+    },
+    "path_body_manual": {
+        "title": "차체 작업 절차",
+        "document_type": "body_manual_procedure",
+        "vehicle": {"brand": "Hyundai", "model": "", "year": "", "body_type": ""},
+        "breadcrumbs": [],
+        "summary": "",
+        "required_tools": [],
+        "procedure_steps": [
+            {"step": 1, "action": "", "note": "", "torque": ""}
+        ],
+        "related_fasteners": [],
+        "cautions": [],
+    },
+    "path_connector": {
+        "title": "커넥터 배치 정보",
+        "document_type": "wiring_connector_reference",
+        "vehicle": {"brand": "Hyundai", "model": "", "year": ""},
+        "breadcrumbs": [],
+        "summary": "",
+        "connector": {"name": "", "location": "", "pin_count": 0},
+        "pin_map": [
+            {"pin": "", "signal": "", "wire_color": "", "description": ""}
+        ],
+        "cautions": [],
+    },
 }
 
 PIPELINE_MODES = [
@@ -333,6 +392,10 @@ def render_vision_input_mode() -> None:
     market = col5.selectbox("타겟 시장", ["GLOBAL", "VN", "KR", "US"])
 
     st.caption(f"📍 현재 활성화된 AI 스키마: `{schema_key}` | 탐색 경로: `{path_hint}`")
+    template_hint = GSW_JSON_TEMPLATES.get(schema_key)
+    if template_hint:
+        with st.expander("권장 JSON 템플릿", expanded=schema_key == "path_vehicle_id"):
+            st.json(template_hint)
 
     uploaded_file = st.file_uploader("문서/스크린샷 업로드 (최대 200MB)", type=["png", "jpg", "jpeg", "pdf"])
 
@@ -368,6 +431,12 @@ def render_vision_input_mode() -> None:
             f"Selected path hint: {path_hint}",
             f"Selected market: {market}",
         ]
+        template_block = ""
+        if template_hint:
+            template_block = (
+                "\n\n[권장 JSON 템플릿]\n"
+                + json.dumps(template_hint, ensure_ascii=False, indent=2)
+            )
 
         with st.spinner(f"'{identifier}' 문서를 해독 중입니다. 잠시만 기다려주세요..."):
             analysis_result, queue_result = process_vision_and_save(
@@ -378,7 +447,7 @@ def render_vision_input_mode() -> None:
                 market=market,
                 source_path_hint=path_hint,
                 document_type=selected_type,
-                prompt_override=f"{prompt_value(schema_key)}\n\n" + "\n".join(context_lines),
+                prompt_override=f"{prompt_value(schema_key)}{template_block}\n\n" + "\n".join(context_lines),
             )
 
         analysis_result = assess_analysis_quality(analysis_result)
@@ -649,14 +718,14 @@ def render_review_mode() -> None:
     selected_label = st.selectbox("검수 대상", list(item_lookup.keys()))
     item = item_lookup[selected_label]
 
-    st.write(f"### 부품 번호: `{item.get('part_number', 'Unknown')}`")
+    raw_json = item.get("raw_json", {})
+    display_title = raw_json.get("title") or raw_json.get("summary") or item.get("part_number", "Unknown")
+    st.write(f"### 문서/식별자: `{display_title}`")
     st.caption(
         f"OEM 브랜드: {item.get('oem_brand', '-') or '-'} | "
         f"시장: {item.get('market', 'GLOBAL')} | "
         f"문서 종류: {item.get('document_type', '-')}"
     )
-
-    raw_json = item.get("raw_json", {})
     edited_json = st.text_area(
         "AI 추출 원본 (수정 가능)",
         value=json.dumps(raw_json, indent=2, ensure_ascii=False),
@@ -664,7 +733,7 @@ def render_review_mode() -> None:
     )
 
     col1, col2 = st.columns(2)
-    if col1.button("✅ 승인 및 정식 DB 이관", type="primary", use_container_width=True):
+    if col1.button("✅ 승인 및 정식 문서 DB 반영", type="primary", use_container_width=True):
         try:
             edited_payload = json.loads(edited_json)
             if not isinstance(edited_payload, dict):
@@ -679,7 +748,7 @@ def render_review_mode() -> None:
             edited_payload=edited_payload,
         )
         if result["saved"]:
-            st.success("정식 DB로 이관되었습니다.")
+            st.success(result["message"])
             st.rerun()
         st.error(result["message"])
 
@@ -746,7 +815,9 @@ def render_settings_mode() -> None:
             "관리할 프롬프트",
             [
                 "path_manual",
+                "path_body_manual",
                 "path_detail",
+                "path_connector",
                 "path_vehicle_id",
                 "path_wiring",
                 "path_dtc",
