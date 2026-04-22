@@ -14,6 +14,8 @@ RUN if ! id -u pwuser >/dev/null 2>&1; then \
 WORKDIR /home/pwuser/app
 
 COPY requirements.txt ./
+COPY requirements-streamlit.txt ./
+COPY requirements-weviko-crawler.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --chown=pwuser:pwuser . .
