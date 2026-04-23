@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Weviko Capture</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4efe6;
+      --panel: rgba(255, 255, 255, 0.92);
+      --line: #d7c9ad;
+      --text: #1e261f;
+      --muted: #5d685c;
+      --accent: #245846;
+      --accent-2: #9c4f12;
+    }
+    body {
+      width: 360px;
+      margin: 0;
+      font: 13px/1.45 "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top right, rgba(36, 88, 70, 0.14), transparent 30%),
+        linear-gradient(180deg, #fbf6ed 0%, var(--bg) 100%);
+    }
+    main {
+      padding: 14px;
+    }
+    h1 {
+      margin: 0 0 4px;
+      font-size: 19px;
+    }
+    p {
+      margin: 0;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 12px;
+      margin-bottom: 10px;
+      box-shadow: 0 10px 24px rgba(58, 43, 16, 0.08);
+    }
+    .meta {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    label {
+      display: block;
+      margin-top: 8px;
+      margin-bottom: 4px;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    input,
+    select,
+    textarea,
+    button {
+      width: 100%;
+      box-sizing: border-box;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      padding: 9px 10px;
+      font: inherit;
+      color: var(--text);
+      background: white;
+    }
+    textarea {
+      resize: vertical;
+      min-height: 54px;
+    }
+    button {
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.primary {
+      background: var(--accent);
+      color: white;
+      border-color: var(--accent);
+    }
+    button.secondary {
+      background: white;
+      color: var(--accent-2);
+      border-color: var(--line);
+    }
+    .actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .status {
+      min-height: 40px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .status.ok {
+      color: var(--accent);
+    }
+    .status.error {
+      color: #8c2e14;
+    }
+    .small {
+      font-size: 11px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="panel">
+      <h1>Weviko Capture</h1>
+      <p class="meta">Manual current-tab capture for the workshop pipeline.</p>
+      <p id="active-tab" class="meta" style="margin-top: 8px;"></p>
+    </div>
+
+    <form id="capture-form">
+      <div class="panel">
+        <label for="server-url">Server URL</label>
+        <input id="server-url" name="serverUrl" type="url" placeholder="http://127.0.0.1:8765">
+
+        <div class="grid">
+          <div>
+            <label for="schema-key">Schema</label>
+            <select id="schema-key" name="schemaKey">
+              <option value="auto">Auto detect</option>
+              <option value="path_detail">Part detail</option>
+              <option value="path_manual">Service manual</option>
+              <option value="path_body_manual">Body manual</option>
+              <option value="path_wiring">Wiring</option>
+              <option value="path_connector">Connector</option>
+              <option value="path_dtc">DTC</option>
+              <option value="path_vehicle_id">Vehicle ID / VIN</option>
+              <option value="path_community">Community</option>
+            </select>
+          </div>
+          <div>
+            <label for="market">Market</label>
+            <select id="market" name="market">
+              <option value="GLOBAL">GLOBAL</option>
+              <option value="KR">KR</option>
+              <option value="VN">VN</option>
+              <option value="US">US</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="grid">
+          <div>
+            <label for="destination">Destination</label>
+            <select id="destination" name="destination">
+              <option value="pending">Pending</option>
+              <option value="parts">Parts</option>
+            </select>
+          </div>
+          <div>
+            <label for="oem-brand">OEM Brand</label>
+            <input id="oem-brand" name="oemBrand" type="text" placeholder="Hyundai">
+          </div>
+        </div>
+
+        <label for="part-number-hint">Part Number Hint</label>
+        <input id="part-number-hint" name="partNumberHint" type="text" placeholder="58350H6A00">
+
+        <label for="vehicle-hint">Vehicle Hint</label>
+        <input id="vehicle-hint" name="vehicleHint" type="text" placeholder="Accent 2015 1.6">
+
+        <label for="system-hint">System / Part Hint</label>
+        <input id="system-hint" name="systemHint" type="text" placeholder="Front brake pad">
+
+        <label for="operator-identifier">Operator Identifier</label>
+        <input id="operator-identifier" name="operatorIdentifier" type="text" placeholder="Workshop desk 1">
+
+        <label for="operator-note">Operator Note</label>
+        <textarea id="operator-note" name="operatorNote" placeholder="Optional note for this capture"></textarea>
+
+        <div class="actions">
+          <button id="health-check" class="secondary" type="button">Check Server</button>
+          <button id="capture-button" class="primary" type="submit">Capture Tab</button>
+        </div>
+      </div>
+    </form>
+
+    <div class="panel">
+      <div id="status" class="status meta">Ready.</div>
+      <p class="meta small" style="margin-top: 8px;">This extension captures only the active tab after you click the button. It does not run in the background automatically.</p>
+    </div>
+  </main>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

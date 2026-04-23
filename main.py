@@ -52,7 +52,15 @@ LEGACY_GEMINI_MODEL_ALIASES = {
 
 class FactData(BaseModel):
     part_number: str = Field(default="Unknown")
+    oem_brand: str = Field(default="")
+    document_type: str = Field(default="Unknown")
+    title: str = Field(default="")
+    summary: str = Field(default="")
+    vehicle: dict[str, Any] = Field(default_factory=dict)
+    compatibility: list[dict[str, Any]] = Field(default_factory=list)
+    specifications: dict[str, Any] = Field(default_factory=dict)
     extracted_facts: dict[str, Any] = Field(default_factory=dict)
+    cautions: list[str] = Field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -162,11 +170,18 @@ def build_supabase_client():
     supabase_key = (
         os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
         or os.getenv("SUPABASE_SECRET_KEY", "").strip()
+        or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY", "").strip()
     )
 
     if not supabase_url or not supabase_key:
         print("[Setup] Supabase env vars are missing. Cache and DB writes are disabled.")
         return None
+
+    if not (
+        os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+        or os.getenv("SUPABASE_SECRET_KEY", "").strip()
+    ):
+        print("[Setup] Using NEXT_PUBLIC_SUPABASE_ANON_KEY fallback. Write access depends on Supabase policies.")
 
     return create_client(supabase_url, supabase_key)
 
@@ -245,6 +260,47 @@ def invoke_llm_with_fallback(
     if last_error is not None:
         raise last_error
     return None
+
+
+def build_factory_extraction_prompt(schema_key: str) -> str:
+    base_prompt = (
+        "You are extracting automotive service intelligence for a repair-shop search system. "
+        "Return only structured data that can help technicians, parts advisors, and vehicle-registration staff. "
+        "Do not invent values. If a value is missing, keep it empty or use `Unknown` for identifiers. "
+        "Keep `summary` short and factual. Put only measurable or operational facts into `extracted_facts` and `specifications`."
+    )
+
+    schema_instructions = {
+        "path_detail": (
+            "Focus on part number, OEM brand, compatible vehicle models/years, engine or trim conditions, "
+            "dimensions, torque, material, package contents, and interchange notes."
+        ),
+        "path_manual": (
+            "Focus on service procedures, required tools, torque values, cautions, removal or installation order, "
+            "and inspection checkpoints."
+        ),
+        "path_body_manual": (
+            "Focus on body-panel procedure steps, attachment points, sealant or adhesive notes, fastening sequence, "
+            "alignment notes, and cautions."
+        ),
+        "path_connector": (
+            "Focus on connector name, location, pin count, pin map, wire colors, signal names, and mating target."
+        ),
+        "path_vehicle_id": (
+            "This may be a VIN, paint code, engine code, or vehicle identification document. "
+            "Do not force a part number. Prefer identification facts, label locations, and code examples."
+        ),
+        "path_wiring": (
+            "Focus on wiring points, connectors, pin labels, measurable voltages or resistances, and diagnostic notes."
+        ),
+        "path_dtc": (
+            "Focus on DTC code, symptoms, likely causes, inspection steps, and recommended repair actions."
+        ),
+        "path_community": (
+            "Focus on repeatable field fixes, symptoms, verified compatibility clues, and practical workshop cautions."
+        ),
+    }
+    return f"{base_prompt} {schema_instructions.get(schema_key, '')}".strip()
 
 
 class WevikoSpider:
@@ -742,10 +798,12 @@ class WevikoBrain:
                     .upsert(
                         {
                             "part_number": result.part_number,
+                            "oem_brand": result.oem_brand,
                             "market": self.target_market,
                             "schema_key": self.schema_key,
+                            "document_type": result.document_type,
                             "source_type": self.source_type,
-                            "spec_data": result.extracted_facts,
+                            "spec_data": result.model_dump(),
                             "updated_at": timestamp,
                         },
                         on_conflict="part_number",
@@ -767,10 +825,20 @@ class WevikoBrain:
                 "status": "Queued",
                 "target_market": self.target_market,
                 "part_number": "",
+                "oem_brand": "",
+                "document_type": "",
+                "title": "",
+                "summary": "",
+                "vehicle": {},
+                "compatibility": [],
+                "specifications": {},
                 "extracted_facts_count": 0,
                 "extracted_facts": {},
+                "cautions": [],
                 "content_hash": "",
                 "compressed_chars": 0,
+                "cache_hit": False,
+                "skip_reason": "",
             }
             self.rows_by_url[fetch_result.requested_url] = row
             self.rows.append(row)
@@ -789,6 +857,7 @@ class WevikoBrain:
 
         if route_status == "content_page":
             row["status"] = "Fetched"
+            row["skip_reason"] = ""
             return
 
         if route_status == "auth_required":
@@ -797,6 +866,7 @@ class WevikoBrain:
             row["status"] = "Broken Public Route"
         else:
             row["status"] = route_status
+        row["skip_reason"] = route_status
 
         extra = ""
         if fetch_result.final_url != fetch_result.requested_url:
@@ -813,6 +883,7 @@ class WevikoBrain:
         row = self._ensure_row(fetch_result)
         row["status"] = "No Useful Text"
         row["compressed_chars"] = 0
+        row["skip_reason"] = "no_useful_text"
 
     def print_route_summary(self) -> None:
         if not self.route_status_counts:
@@ -835,11 +906,14 @@ class WevikoBrain:
         row["content_hash"] = content_hash
         if self._is_cached(content_hash):
             row["status"] = "Cache Hit"
+            row["cache_hit"] = True
+            row["skip_reason"] = "cache_hit"
             print(f"[Cache Hit] no content change. Skipping AI extraction: {url}")
             return None
 
         if self.llm is None:
             row["status"] = "Content Captured"
+            row["skip_reason"] = "model_unavailable"
             print(f"[AI] model unavailable. Storing raw crawl metadata only: {url}")
             self._persist_result(url, content_hash, None)
             return None
@@ -849,7 +923,8 @@ class WevikoBrain:
             f"from {len(compressed_markdown)} characters..."
         )
         prompt = (
-            "Extract the automotive part number and any measurable facts from the compressed body below. "
+            f"{build_factory_extraction_prompt(self.schema_key)}\n"
+            f"Active schema key: {self.schema_key}\n"
             "Return data that matches the provided structured schema."
         )
         result = await asyncio.to_thread(
@@ -859,14 +934,24 @@ class WevikoBrain:
         )
         if result is None:
             row["status"] = "Model Unavailable"
+            row["skip_reason"] = "model_unavailable"
             print(f"[AI] no supported Gemini model is available right now: {url}")
             self._persist_result(url, content_hash, None)
             return None
 
         row["status"] = "AI Extracted"
         row["part_number"] = result.part_number
+        row["oem_brand"] = result.oem_brand
+        row["document_type"] = result.document_type
+        row["title"] = result.title
+        row["summary"] = result.summary
+        row["vehicle"] = result.vehicle
+        row["compatibility"] = result.compatibility
+        row["specifications"] = result.specifications
         row["extracted_facts"] = result.extracted_facts
         row["extracted_facts_count"] = len(result.extracted_facts)
+        row["cautions"] = result.cautions
+        row["skip_reason"] = ""
         self._persist_result(url, content_hash, result)
         print(f"   -> processed successfully (hash: {content_hash[:8]}...)")
         return result

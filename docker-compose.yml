@@ -9,7 +9,6 @@ services:
       - .env
     environment:
       PORT: 10000
-    user: pwuser
     init: true
     ipc: host
     ports:

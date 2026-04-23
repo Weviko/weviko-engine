@@ -7,6 +7,12 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+from live_capture import (
+    build_live_capture_bookmarklet,
+    live_capture_allowed_hosts,
+    live_capture_base_url,
+    live_capture_direct_enabled,
+)
 from weviko_engine import run_crawler_sync
 from weviko_factory import run_factory
 
@@ -21,6 +27,7 @@ from streamlit_services import (
     fetch_untranslated_parts,
     get_config_prompt,
     llm_available,
+    log_dead_letter,
     load_config_prompts,
     persist_factory_rows,
     process_scraped_text_and_save,
@@ -36,7 +43,8 @@ from streamlit_services import (
 
 load_dotenv()
 
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "weviko1234!")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
+INSECURE_ADMIN_PASSWORDS = {"", "weviko1234!", "changeme", "admin"}
 
 WEVIKO_PATH_MAP = {
     "🛠️ 정비 지침서 (/shop/manual/)": "path_manual",
@@ -161,6 +169,7 @@ GSW_JSON_TEMPLATES = {
 
 PIPELINE_MODES = [
     "📷 수동 캡처(Vision)",
+    "🛰️ 현재 탭 라이브 캡처",
     "🏭 대규모 양산 팩토리(URL)",
 ]
 
@@ -296,6 +305,9 @@ def inject_styles() -> None:
 
 
 def ensure_login() -> None:
+    ensure_login_secure()
+    return
+
     if st.session_state["logged_in"]:
         return
 
@@ -306,6 +318,25 @@ def ensure_login() -> None:
             st.session_state["logged_in"] = True
             st.rerun()
         st.error("접근 암호가 올바르지 않습니다.")
+    st.stop()
+
+
+def ensure_login_secure() -> None:
+    if st.session_state["logged_in"]:
+        return
+
+    st.title("Weviko OS v5.0 Login")
+    if ADMIN_PASSWORD in INSECURE_ADMIN_PASSWORDS:
+        st.error("ADMIN_PASSWORD is required before this console can be used.")
+        st.caption("Set a strong ADMIN_PASSWORD in `.env` or your deployment secrets, then restart the app.")
+        st.stop()
+
+    password = st.text_input("Admin password", type="password")
+    if st.button("Enter console", type="primary", use_container_width=True):
+        if password == ADMIN_PASSWORD:
+            st.session_state["logged_in"] = True
+            st.rerun()
+        st.error("The password is incorrect.")
     st.stop()
 
 
@@ -500,7 +531,7 @@ def render_vision_input_mode() -> None:
 
         analysis_mode = analysis_result.get("analysis_mode", "")
         quality_status = analysis_result.get("quality_status", "ok")
-        if analysis_mode == "gemini" and queue_result["saved"] and quality_status == "ok":
+        if analysis_mode in {"gemini", "gemini_structured", "gemini_unstructured_fallback"} and queue_result["saved"] and quality_status in {"ok", "high"}:
             st.success("✅ 데이터 추출 성공! '검수 대기열'로 이동했습니다.")
         elif queue_result["saved"] and quality_status == "low":
             st.warning("⚠️ 저장은 완료됐지만, 이번 결과는 구조화 정확도가 낮아서 재정리가 필요할 수 있습니다.")
@@ -583,6 +614,65 @@ def render_vision_input_mode() -> None:
             navigate_to_mode("데이터 관리/제어", "📊 통합 현황 및 백업")
 
 
+def render_live_capture_mode() -> None:
+    st.title("🛰️ 현재 탭 라이브 캡처")
+    st.markdown(
+        "정비소에서 실제로 보고 있는 웹페이지를 작업자가 직접 보내면, "
+        "현재의 Gemini 구조화와 Direct/Pending 저장 파이프라인으로 바로 이어집니다."
+    )
+    st.info(
+        "수동 승인형 반자동 모드입니다. 허용된 호스트에서만 사용하고, 기본 운영은 `Pending` 중심으로 시작하는 것을 권장합니다."
+    )
+
+    server_url = live_capture_base_url()
+    bookmarklet_code = build_live_capture_bookmarklet(server_url)
+    allowed_hosts = live_capture_allowed_hosts()
+
+    col1, col2 = st.columns(2)
+    col1.metric("Live Capture Server", server_url)
+    col2.metric("Direct Live Capture", "Enabled" if live_capture_direct_enabled() else "Pending Only")
+
+    st.subheader("1. 서버 실행")
+    st.code("python live_capture_server.py", language="bash")
+    st.caption(f"실행 후 브라우저에서 `{server_url}` 를 열면 북마클릿 안내 페이지가 나타납니다.")
+
+    st.subheader("2. 허용 호스트 확인")
+    st.write(", ".join(allowed_hosts))
+    st.caption("`.env`의 `WEVIKO_ALLOWED_CAPTURE_HOSTS`에 명시한 도메인만 북마클릿 전송이 허용됩니다.")
+
+    st.subheader("3. 북마클릿 만들기")
+    st.caption("브라우저 북마크를 새로 만들고, URL 칸에 아래 코드를 그대로 붙여 넣으세요.")
+    st.code(bookmarklet_code, language="javascript")
+
+    st.subheader("3A. Chrome 확장 사용")
+    st.caption("더 안정적인 현재 탭 수집이 필요하면 `chrome_extension/weviko-live-capture` 폴더를 Chrome의 `Load unpacked`로 로드하세요.")
+    st.code("chrome_extension/weviko-live-capture", language="text")
+
+    st.subheader("4. 현장 운영 순서")
+    st.markdown(
+        "\n".join(
+            [
+                "- 로그인이나 검색 필터를 이미 적용한 상태에서 대상 페이지를 엽니다.",
+                "- 필요한 문장이나 부품번호를 마우스로 선택한 뒤 북마클릿을 누릅니다.",
+                "- 스키마와 도착지(`pending` 권장)를 확인하고 전송합니다.",
+                "- 결과는 기존 검수소, Parts, dead_letters에서 같은 방식으로 확인합니다.",
+            ]
+        )
+    )
+
+    st.subheader("안전 가이드")
+    st.markdown(
+        "\n".join(
+            [
+                "- 소유하거나 계약상 접근 권한이 있는 사이트에서만 사용하세요.",
+                "- 우회 로그인, 차단 회피, 유료 콘텐츠 무단 복제 용도로 사용하지 마세요.",
+                "- 고객 개인정보, 연락처, 차량번호, VIN 전체값은 필요한 경우에만 취급하고 최소한으로 저장하세요.",
+                "- 초반에는 `WEVIKO_LIVE_CAPTURE_DIRECT_ENABLED=false` 상태로 검수형 운영을 권장합니다.",
+            ]
+        )
+    )
+
+
 def render_factory_mode() -> None:
     st.title("🏭 대규모 크롤링 양산 팩토리")
     st.markdown("특정 카테고리 URL을 입력하면, 하위 페이지를 찾아 병렬 수집한 뒤 원하는 목적지로 보냅니다.")
@@ -648,6 +738,14 @@ def render_factory_mode() -> None:
                     proxy=proxy_value.strip() or None,
                     user_agent=user_agent_value.strip() or None,
                 )
+            if not scraped_text:
+                log_dead_letter(
+                    start_url.strip(),
+                    "single_target_crawl_failed",
+                    source_type="single_target_engine",
+                    schema_key=schema_key,
+                    source_path_hint=path_hint,
+                )
 
             if not scraped_text:
                 st.error("❌ 크롤링 실패 (방화벽 차단 또는 타임아웃). 실패 URL 병원을 확인하세요.")
@@ -685,6 +783,12 @@ def render_factory_mode() -> None:
                 f"수집 텍스트 길이: {len(scraped_text):,}자 | "
                 f"스키마: `{schema_key}` | 경로 힌트: `{path_hint}`"
             )
+            if save_result.get("confidence_score") is not None:
+                st.caption(
+                    f"Confidence: {save_result.get('confidence_score', 0)} / "
+                    f"Threshold {save_result.get('confidence_threshold', '-')}"
+                    f" | Quality: `{payload.get('quality_status', 'unknown')}`"
+                )
             st.caption(save_result.get("message", ""))
             st.json(payload)
             action_col1, action_col2 = st.columns(2)
@@ -754,7 +858,12 @@ def render_factory_mode() -> None:
             f"결과 {persist_result['saved_count']:,}건을 {destination_name}에 반영했습니다."
         )
         st.caption(persist_result["message"])
-
+        if destination == "parts":
+            st.info(
+                f"Direct {persist_result['direct_count']:,} items | "
+                f"Pending {persist_result['pending_count']:,} items | "
+                f"Skipped {persist_result['skipped_count']:,} items"
+            )
         if run_result.route_status_counts:
             status_df = pd.DataFrame(
                 [
@@ -1006,7 +1115,7 @@ def main() -> None:
     st.set_page_config(page_title="Weviko Master OS", page_icon="🌍", layout="wide")
     init_state()
     inject_styles()
-    ensure_login()
+    ensure_login_secure()
 
     mode = render_sidebar()
     render_header()
@@ -1014,6 +1123,8 @@ def main() -> None:
 
     if mode == "📷 수동 캡처(Vision)":
         render_vision_input_mode()
+    elif mode == "🛰️ 현재 탭 라이브 캡처":
+        render_live_capture_mode()
     elif mode == "🏭 대규모 양산 팩토리(URL)":
         render_factory_mode()
     elif mode == "🕵️ 데이터 검수소 (H-i-t-L)":

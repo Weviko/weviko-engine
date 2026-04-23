@@ -39,6 +39,35 @@ class VisionFactBundle(BaseModel):
     )
 
 
+class CrawlFactBundle(BaseModel):
+    """Structured extraction result for crawled automotive text pages."""
+
+    part_number: str = Field(default="Unknown", description="Detected automotive part number.")
+    oem_brand: str = Field(default="", description="OEM brand or manufacturer.")
+    schema_key: str = Field(default="", description="Internal schema key.")
+    source_path_hint: str = Field(default="", description="Selected source path hint.")
+    document_type: str = Field(default="Unknown", description="Detected document type.")
+    title: str = Field(default="", description="Short title for the crawled page.")
+    summary: str = Field(default="", description="Short summary for technicians.")
+    vehicle: dict[str, Any] = Field(default_factory=dict, description="Vehicle applicability metadata.")
+    compatibility: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Vehicle compatibility entries when available.",
+    )
+    specifications: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Structured numeric or categorical specifications.",
+    )
+    extracted_facts: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Only measurable or operational facts extracted from the text.",
+    )
+    cautions: list[str] = Field(
+        default_factory=list,
+        description="Short cautions or ambiguities found during extraction.",
+    )
+
+
 class TranslationBundle(BaseModel):
     """Multilingual translation package for a structured automotive payload."""
 
@@ -62,6 +91,13 @@ def _prompt_store_path() -> Path:
 
 def _clean_json_value(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _safe_console_log(message: str) -> None:
+    try:
+        print(message)
+    except UnicodeEncodeError:
+        print(message.encode("unicode_escape").decode("ascii"))
 
 
 @lru_cache(maxsize=1)
@@ -179,7 +215,7 @@ def load_config_prompts(defaults: dict[str, str]) -> tuple[dict[str, str], str]:
                 prompts[str(prompt_key)] = str(prompt_value)
                 source = "supabase"
     except Exception as exc:
-        print(f"[Configs] prompt load failed. Falling back to local/default prompts: {exc}")
+        _safe_console_log(f"[Configs] prompt load failed. Falling back to local/default prompts: {exc}")
         pass
 
     return prompts, source
@@ -328,6 +364,49 @@ def _insert_remote(table_name: str, payload: dict[str, Any]) -> tuple[bool, str]
         return False, str(exc)
 
 
+def log_dead_letter(
+    url: str,
+    error_reason: str,
+    *,
+    final_url: str = "",
+    source_type: str = "",
+    schema_key: str = "",
+    source_path_hint: str = "",
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    primary_url = str(url or final_url).strip()
+    if not primary_url:
+        return {"saved": False, "message": "dead_letters entry skipped because URL is missing."}
+
+    metadata_parts: list[str] = []
+    if final_url and final_url.strip() and final_url.strip() != primary_url:
+        metadata_parts.append(f"final_url={final_url.strip()}")
+    if source_type:
+        metadata_parts.append(f"source_type={source_type}")
+    if schema_key:
+        metadata_parts.append(f"schema_key={schema_key}")
+    if source_path_hint:
+        metadata_parts.append(f"path_hint={source_path_hint}")
+    if payload:
+        payload_preview = json.dumps(_clean_json_value(payload), ensure_ascii=False)[:800]
+        metadata_parts.append(f"payload={payload_preview}")
+
+    reason = str(error_reason or "unknown_error").strip()
+    if metadata_parts:
+        reason = f"{reason} | {' | '.join(metadata_parts)}"
+
+    saved, message = _insert_remote(
+        dead_letters_table_name(),
+        {
+            "url": primary_url,
+            "error_reason": reason[:3000],
+            "resolved": False,
+            "created_at": _utc_now_iso(),
+        },
+    )
+    return {"saved": saved, "message": message}
+
+
 def _extract_response_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -355,6 +434,103 @@ def _parse_json_text(raw_text: str) -> dict[str, Any]:
     if isinstance(loaded, dict):
         return loaded
     return {"raw_response": loaded}
+
+
+def _response_to_payload(response: Any) -> dict[str, Any]:
+    if isinstance(response, BaseModel):
+        return response.model_dump()
+    return _parse_json_text(_extract_response_text(getattr(response, "content", response)))
+
+
+def _guess_scraped_text_part_number(scraped_text: str) -> str:
+    candidates: list[tuple[int, str]] = []
+    for token in re.findall(r"\b[A-Z0-9-]{5,20}\b", str(scraped_text or "").upper()):
+        cleaned = token.strip("-")
+        if cleaned in {"HTTP", "HTTPS", "HTML", "GLOBAL", "UNKNOWN", "FALSE", "TRUE"}:
+            continue
+        if not any(char.isalpha() for char in cleaned):
+            continue
+        if not any(char.isdigit() for char in cleaned):
+            continue
+        candidates.append((sum(char.isdigit() for char in cleaned) + len(cleaned), cleaned))
+    candidates.sort(reverse=True)
+    return candidates[0][1] if candidates else ""
+
+
+def _build_local_text_fallback_payload(
+    scraped_text: str,
+    *,
+    doc_type_key: str,
+    market: str,
+    part_number_hint: str = "",
+    oem_brand: str = "",
+    source_path_hint: str = "",
+    document_type: str = "",
+    source_url: str = "",
+    vehicle_hint: str = "",
+    system_hint: str = "",
+    operator_identifier: str = "",
+    extra_metadata: dict[str, Any] | None = None,
+    fallback_reason: str = "llm_unavailable",
+) -> dict[str, Any]:
+    lines = [line.strip() for line in str(scraped_text or "").splitlines() if line.strip()]
+    visible_lines = [line for line in lines if not line.startswith("[") and "]" not in line[:40]]
+    page_title = str((extra_metadata or {}).get("page_title") or "").strip()
+    title = page_title or (visible_lines[0] if visible_lines else document_type or doc_type_key or "Captured page")
+    summary_source = " ".join(visible_lines[:8]).strip() or str(scraped_text or "").strip()
+    summary = re.sub(r"\s+", " ", summary_source)[:320].strip()
+    guessed_part_number = _guess_scraped_text_part_number(scraped_text)
+    resolved_part_number = resolve_storage_part_number(
+        doc_type_key,
+        part_number_hint or guessed_part_number,
+        fallback_part_number=part_number_hint or guessed_part_number or source_url,
+    )
+
+    payload: dict[str, Any] = {
+        "part_number": resolved_part_number,
+        "oem_brand": oem_brand,
+        "schema_key": doc_type_key,
+        "source_path_hint": source_path_hint,
+        "document_type": document_type or doc_type_key,
+        "market": market,
+        "title": title[:180],
+        "summary": summary or "Captured page stored without Gemini extraction. Manual review is required.",
+        "vehicle": {},
+        "compatibility": [],
+        "specifications": {},
+        "extracted_facts": {
+            "manual_review_required": True,
+            "fallback_reason": fallback_reason,
+            "guessed_part_number": guessed_part_number,
+            "compressed_chars": len(scraped_text or ""),
+        },
+        "cautions": [
+            "Gemini structured extraction is unavailable, so this record was created in local fallback mode.",
+        ],
+        "analysis_mode": (
+            "local_fallback_no_llm" if fallback_reason == "llm_unavailable" else "local_fallback_after_llm_error"
+        ),
+        "source_url": source_url,
+        "compressed_chars": len(scraped_text or ""),
+        "scraped_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    apply_input_context_to_payload(
+        payload,
+        schema_key=doc_type_key,
+        part_number_hint=part_number_hint,
+        vehicle_hint=vehicle_hint,
+        system_hint=system_hint,
+        operator_identifier=operator_identifier,
+    )
+    if extra_metadata:
+        capture_context = {key: value for key, value in extra_metadata.items() if value not in {"", None, [], {}}}
+        if capture_context:
+            payload["capture_context"] = capture_context
+        capture_type = str(extra_metadata.get("capture_type") or "").strip()
+        if capture_type:
+            payload["capture_type"] = capture_type
+    assess_analysis_quality(payload)
+    return payload
 
 
 PART_NUMBER_REQUIRED_SCHEMAS = {"path_detail"}
@@ -548,29 +724,107 @@ def has_meaningful_structured_content(payload: dict[str, Any]) -> bool:
     return False
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def assess_analysis_quality(payload: dict[str, Any]) -> dict[str, Any]:
     schema_key = str(payload.get("schema_key", "") or "")
     part_number = str(payload.get("part_number", "") or "").strip()
     raw_response = payload.get("raw_response")
     extracted_facts = payload.get("extracted_facts")
     summary = str(payload.get("summary", "") or "").strip()
+    title = str(payload.get("title", "") or "").strip()
+    route_status = str(payload.get("route_status", "") or "").strip()
+    http_status = payload.get("http_status")
+    compressed_chars = _safe_int(payload.get("compressed_chars"), 0)
+    cautions = payload.get("cautions")
+    caution_count = len(cautions) if isinstance(cautions, list) else 0
 
     reasons: list[str] = []
+    score = 35
+
+    if not route_status or route_status == "content_page":
+        score += 8
+    elif route_status == "auth_required":
+        reasons.append("auth_required")
+        score -= 25
+    elif route_status == "broken_public_route":
+        reasons.append("broken_public_route")
+        score -= 30
+    else:
+        reasons.append(f"route_status_{route_status}")
+        score -= 15
+
+    if http_status in {None, 200}:
+        score += 4
+    elif isinstance(http_status, int) and 200 <= http_status < 400:
+        score += 2
+    elif isinstance(http_status, int):
+        reasons.append(f"http_status_{http_status}")
+        score -= 10
+
     if raw_response:
         reasons.append("raw_response_only")
+        score -= 25
     if not isinstance(extracted_facts, dict) or not extracted_facts:
         reasons.append("empty_extracted_facts")
+    else:
+        score += 18
     if not has_meaningful_structured_content(payload):
         reasons.append("empty_structured_content")
+    else:
+        score += 20
     if not summary:
         reasons.append("missing_summary")
+    else:
+        score += 10
+    if title:
+        score += 4
     if schema_requires_part_number(schema_key) and is_placeholder_identifier(part_number):
         reasons.append("placeholder_part_number")
+        score -= 20
+    elif schema_requires_part_number(schema_key):
+        score += 12
+    else:
+        score += 4
 
-    quality_status = "low" if raw_response or "empty_structured_content" in reasons or len(reasons) >= 2 else "ok"
+    if compressed_chars >= 1200:
+        score += 8
+    elif compressed_chars >= 400:
+        score += 5
+    elif compressed_chars > 0:
+        score += 2
+
+    if caution_count >= 3:
+        score -= 6
+    elif caution_count == 1:
+        score += 1
+
+    score = max(0, min(100, score))
+
+    if score >= 85:
+        quality_status = "high"
+    elif score >= 65:
+        quality_status = "ok"
+    else:
+        quality_status = "low"
+
+    payload["confidence_score"] = score
     payload["quality_status"] = quality_status
     payload["quality_reasons"] = reasons
     payload["needs_refinement"] = quality_status == "low"
+    payload["auto_publish_ready"] = (
+        quality_status != "low"
+        and not raw_response
+        and (
+            not schema_requires_part_number(schema_key)
+            or not is_placeholder_identifier(part_number)
+        )
+    )
     return payload
 
 
@@ -896,16 +1150,15 @@ def process_vision_and_save(
             ]
         )
         try:
-            response = invoke_llm_with_fallback([msg])
-            raw_text = _extract_response_text(getattr(response, "content", response))
-            payload = _parse_json_text(raw_text)
+            response = invoke_llm_with_fallback([msg], structured_schema=VisionFactBundle)
+            payload = _response_to_payload(response)
             payload.setdefault("part_number", part_num or "Unknown")
             payload.setdefault("oem_brand", oem_brand)
             payload.setdefault("schema_key", doc_type_key)
             payload.setdefault("source_path_hint", source_path_hint)
             payload.setdefault("document_type", document_type)
             payload.setdefault("market", market)
-            payload["analysis_mode"] = "gemini"
+            payload["analysis_mode"] = "gemini_structured"
             payload["captured_at"] = datetime.now().isoformat(timespec="seconds")
         except Exception as exc:
             payload = {
@@ -985,17 +1238,23 @@ def process_scraped_text_and_save(
     destination: str,
     *,
     part_number_hint: str = "",
+    oem_brand: str = "",
     source_path_hint: str = "",
     document_type: str = "",
     source_url: str = "",
+    vehicle_hint: str = "",
+    system_hint: str = "",
+    operator_identifier: str = "",
+    extra_metadata: dict[str, Any] | None = None,
+    source_type_override: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     llm = get_cached_llm()
     client = get_cached_supabase_client()
+    resolved_source_type = source_type_override or doc_type_key
 
     if client is None:
         return {}, {"saved": False, "message": "Supabase가 설정되지 않았습니다."}
-    if llm is None:
-        return {}, {"saved": False, "message": "Google API / Gemini가 설정되지 않았습니다."}
+    payload: dict[str, Any]
 
     system_prompt = get_system_prompt(
         doc_type_key,
@@ -1008,22 +1267,94 @@ def process_scraped_text_and_save(
         ]
     )
 
-    try:
-        response = invoke_llm_with_fallback([msg])
-        raw_text = _extract_response_text(getattr(response, "content", response))
-        payload = _parse_json_text(raw_text)
-        payload["part_number"] = resolve_storage_part_number(
-            doc_type_key,
-            payload.get("part_number"),
-            fallback_part_number=part_number_hint,
+    if llm is None:
+        payload = _build_local_text_fallback_payload(
+            scraped_text,
+            doc_type_key=doc_type_key,
+            market=market,
+            part_number_hint=part_number_hint,
+            oem_brand=oem_brand,
+            source_path_hint=source_path_hint,
+            document_type=document_type,
+            source_url=source_url,
+            vehicle_hint=vehicle_hint,
+            system_hint=system_hint,
+            operator_identifier=operator_identifier,
+            extra_metadata=extra_metadata,
+            fallback_reason="llm_unavailable",
         )
-        payload.setdefault("source_path_hint", source_path_hint)
-        payload.setdefault("schema_key", doc_type_key)
-        payload.setdefault("market", market)
-        payload["scraped_at"] = datetime.now().isoformat(timespec="seconds")
-        assess_analysis_quality(payload)
-    except Exception as exc:
-        return {}, {"saved": False, "message": f"Gemini 분석 실패: {exc}"}
+    else:
+        try:
+            response = invoke_llm_with_fallback([msg], structured_schema=CrawlFactBundle)
+            payload = _response_to_payload(response)
+            payload["part_number"] = resolve_storage_part_number(
+                doc_type_key,
+                payload.get("part_number"),
+                fallback_part_number=part_number_hint,
+            )
+            payload.setdefault("oem_brand", "")
+            payload.setdefault("source_path_hint", source_path_hint)
+            payload.setdefault("schema_key", doc_type_key)
+            payload.setdefault("document_type", document_type or doc_type_key)
+            payload.setdefault("market", market)
+            payload.setdefault("title", "")
+            payload.setdefault("summary", "")
+            payload.setdefault("vehicle", {})
+            payload.setdefault("compatibility", [])
+            payload.setdefault("specifications", {})
+            payload.setdefault("extracted_facts", {})
+            payload.setdefault("cautions", [])
+            payload["analysis_mode"] = "gemini_structured"
+            payload["source_url"] = source_url
+            payload["compressed_chars"] = len(scraped_text)
+            payload["scraped_at"] = datetime.now().isoformat(timespec="seconds")
+            if oem_brand and not payload.get("oem_brand"):
+                payload["oem_brand"] = oem_brand
+            apply_input_context_to_payload(
+                payload,
+                schema_key=doc_type_key,
+                part_number_hint=part_number_hint,
+                vehicle_hint=vehicle_hint,
+                system_hint=system_hint,
+                operator_identifier=operator_identifier,
+            )
+            if extra_metadata:
+                capture_context = payload.get("capture_context")
+                if not isinstance(capture_context, dict):
+                    capture_context = {}
+                for key, value in extra_metadata.items():
+                    if value is None:
+                        continue
+                    if isinstance(value, str) and not value.strip():
+                        continue
+                    if isinstance(value, (list, dict)) and not value:
+                        continue
+                    capture_context[key] = value
+                if capture_context:
+                    payload["capture_context"] = capture_context
+                capture_type = str(extra_metadata.get("capture_type") or "").strip()
+                if capture_type:
+                    payload["capture_type"] = capture_type
+                page_title = str(extra_metadata.get("page_title") or "").strip()
+                if page_title and not payload.get("title"):
+                    payload["title"] = page_title
+            assess_analysis_quality(payload)
+        except Exception as exc:
+            payload = _build_local_text_fallback_payload(
+                scraped_text,
+                doc_type_key=doc_type_key,
+                market=market,
+                part_number_hint=part_number_hint,
+                oem_brand=oem_brand,
+                source_path_hint=source_path_hint,
+                document_type=document_type,
+                source_url=source_url,
+                vehicle_hint=vehicle_hint,
+                system_hint=system_hint,
+                operator_identifier=operator_identifier,
+                extra_metadata=extra_metadata,
+                fallback_reason=f"llm_error:{exc}",
+            )
 
     temp_part_number = resolve_storage_part_number(
         doc_type_key,
@@ -1039,14 +1370,14 @@ def process_scraped_text_and_save(
             market=market,
             schema_key=doc_type_key,
             source_path_hint=source_path_hint,
-            source_type=doc_type_key,
+            source_type=resolved_source_type,
             document_type=document_type or doc_type_key,
         )
         return payload, save_result
 
     gsw_result = save_gsw_document(
         payload,
-        source_type=doc_type_key,
+        source_type=resolved_source_type,
         status="pending",
         source_url=source_url,
         fallback_schema_key=doc_type_key,
@@ -1066,7 +1397,7 @@ def process_scraped_text_and_save(
                 "schema_key": doc_type_key,
                 "source_path_hint": source_path_hint,
                 "document_type": document_type or doc_type_key,
-                "source_type": doc_type_key,
+                "source_type": resolved_source_type,
                 "raw_json": payload,
                 "status": "pending",
                 "created_at": _utc_now_iso(),
@@ -1294,7 +1625,7 @@ def fetch_pending_items(limit: int = 20) -> list[dict[str, Any]]:
         )
         return list(getattr(response, "data", []) or [])
     except Exception as exc:
-        print(f"[Pending] fetch failed: {exc}")
+        _safe_console_log(f"[Pending] fetch failed: {exc}")
         return []
 
 
@@ -1433,7 +1764,7 @@ def fetch_untranslated_parts(limit: int = 5) -> list[dict[str, Any]]:
         )
         return list(getattr(response, "data", []) or [])
     except Exception as exc:
-        print(f"[Parts] untranslated fetch failed: {exc}")
+        _safe_console_log(f"[Parts] untranslated fetch failed: {exc}")
         return []
 
 
@@ -1487,6 +1818,11 @@ def save_crawled_data(
         fallback_part_number=part_number,
     )
     raw_json["part_number"] = resolved_part_number
+    raw_json.setdefault("schema_key", schema_key)
+    raw_json.setdefault("source_path_hint", source_path_hint)
+    raw_json.setdefault("document_type", document_type)
+    raw_json.setdefault("market", market)
+    assess_analysis_quality(raw_json)
 
     gsw_result = save_gsw_document(
         raw_json,
@@ -1500,6 +1836,15 @@ def save_crawled_data(
         fallback_part_number=resolved_part_number,
     )
     if not gsw_result["saved"]:
+        log_dead_letter(
+            str(raw_json.get("source_url") or raw_json.get("url") or ""),
+            gsw_result["message"],
+            final_url=str(raw_json.get("final_url") or ""),
+            source_type=source_type,
+            schema_key=schema_key,
+            source_path_hint=source_path_hint,
+            payload=raw_json,
+        )
         return {
             "saved": False,
             "destination": "none",
@@ -1508,6 +1853,7 @@ def save_crawled_data(
 
     confidence_threshold = get_config_int_value("confidence_threshold", 90)
     score = raw_json.get("confidence_score", 0)
+    auto_publish_ready = bool(raw_json.get("auto_publish_ready", False))
     try:
         score_value = int(score)
     except (TypeError, ValueError):
@@ -1538,7 +1884,7 @@ def save_crawled_data(
                 "message": "문서형 크롤링 결과라서 gsw_documents와 검수 대기열에 저장했습니다.",
             }
 
-        if score_value >= confidence_threshold:
+        if score_value >= confidence_threshold and auto_publish_ready:
             client.table(parts_table_name()).upsert(
                 {
                     "part_number": resolved_part_number,
@@ -1582,6 +1928,15 @@ def save_crawled_data(
             "message": f"신뢰도 {score_value}점으로 검수 대기열에 저장했습니다.",
         }
     except Exception as exc:
+        log_dead_letter(
+            str(raw_json.get("source_url") or raw_json.get("url") or ""),
+            f"crawl_save_failed: {exc}",
+            final_url=str(raw_json.get("final_url") or ""),
+            source_type=source_type,
+            schema_key=schema_key,
+            source_path_hint=source_path_hint,
+            payload=raw_json,
+        )
         return {
             "saved": False,
             "destination": "none",
@@ -1625,22 +1980,61 @@ def persist_factory_rows(
             fallback_part_number=row.get("final_url") or row.get("url") or "Unknown",
         )
 
-        if route_status != "content_page" and not extracted_facts:
-            skipped_count += 1
-            continue
-
         payload = {
             "part_number": identifier,
+            "oem_brand": row.get("oem_brand", ""),
             "source_url": row.get("url", ""),
             "final_url": row.get("final_url", ""),
             "http_status": row.get("http_status"),
             "route_status": route_status,
             "route_reason": row.get("route_reason", ""),
+            "document_type": row.get("document_type") or document_type,
+            "title": row.get("title", ""),
+            "summary": row.get("summary", ""),
+            "vehicle": row.get("vehicle") or {},
+            "compatibility": row.get("compatibility") or [],
+            "specifications": row.get("specifications") or {},
             "content_hash": row.get("content_hash", ""),
             "compressed_chars": row.get("compressed_chars", 0),
             "extracted_facts": extracted_facts,
+            "cautions": row.get("cautions") or [],
+            "schema_key": schema_key,
+            "source_path_hint": source_path_hint,
+            "market": market,
+            "status": row.get("status", ""),
         }
         assess_analysis_quality(payload)
+        row_has_content = has_meaningful_structured_content(payload) or bool(payload.get("summary"))
+
+        if row.get("cache_hit"):
+            skipped_count += 1
+            continue
+
+        if route_status != "content_page":
+            skipped_count += 1
+            log_dead_letter(
+                payload["source_url"],
+                f"route_not_persisted: {route_status or 'unknown'} / {payload.get('route_reason', '')}",
+                final_url=payload["final_url"],
+                source_type=source_type,
+                schema_key=schema_key,
+                source_path_hint=source_path_hint,
+                payload=payload,
+            )
+            continue
+
+        if not row_has_content:
+            skipped_count += 1
+            log_dead_letter(
+                payload["source_url"],
+                f"empty_structured_payload: {payload.get('status', '') or row.get('skip_reason', '') or 'unknown'}",
+                final_url=payload["final_url"],
+                source_type=source_type,
+                schema_key=schema_key,
+                source_path_hint=source_path_hint,
+                payload=payload,
+            )
+            continue
 
         try:
             if destination == "parts":
@@ -1690,6 +2084,15 @@ def persist_factory_rows(
             saved_count += 1
         except Exception as exc:
             errors.append(str(exc))
+            log_dead_letter(
+                payload["source_url"],
+                f"persist_factory_rows_failed: {exc}",
+                final_url=payload["final_url"],
+                source_type=source_type,
+                schema_key=schema_key,
+                source_path_hint=source_path_hint,
+                payload=payload,
+            )
 
     message = (
         f"{saved_count}건 저장 완료"
@@ -1726,7 +2129,7 @@ def fetch_dead_letters(limit: int = 200) -> list[dict[str, Any]]:
         )
         return list(getattr(response, "data", []) or [])
     except Exception as exc:
-        print(f"[DLQ] fetch failed: {exc}")
+        _safe_console_log(f"[DLQ] fetch failed: {exc}")
         return []
 
 
@@ -1739,7 +2142,7 @@ def fetch_parts_export() -> list[dict[str, Any]]:
         response = client.table(parts_table_name()).select("*").execute()
         return list(getattr(response, "data", []) or [])
     except Exception as exc:
-        print(f"[Parts] export fetch failed: {exc}")
+        _safe_console_log(f"[Parts] export fetch failed: {exc}")
         return []
 
 
@@ -1752,7 +2155,7 @@ def fetch_parts_count() -> int:
         response = client.table(parts_table_name()).select("part_number", count="exact").execute()
         return int(getattr(response, "count", 0) or 0)
     except Exception as exc:
-        print(f"[Parts] count fetch failed: {exc}")
+        _safe_console_log(f"[Parts] count fetch failed: {exc}")
         return 0
 
 
