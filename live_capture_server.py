@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import html
+import time
+import logging
 import json
 import os
 from datetime import datetime, timezone
@@ -21,7 +23,9 @@ from live_capture import (
     live_capture_port,
 )
 from streamlit_services import log_dead_letter, process_scraped_text_and_save
-
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 load_dotenv()
 
@@ -51,11 +55,6 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
 
-
-def _server_message(message: str, *, extra: str = "") -> str:
-    if extra:
-        return f"{message} {extra}".strip()
-    return message
 
 
 def build_health_payload() -> dict[str, Any]:
@@ -155,6 +154,9 @@ def build_setup_html() -> str:
     <div class="panel">
       <h1>Weviko Live Browser Capture</h1>
       <p class="meta">Server: <code>{html.escape(live_capture_base_url())}</code></p>
+      <p class="meta">Status: <code>{server_status_text}</code></p>
+      <p class="meta">Uptime: <code>{server_uptime}</code></p>
+      <p class="meta">Started: <code>{server_start_time}</code></p>
       <p class="meta">Allowed hosts: <code>{html.escape(allowed_hosts)}</code></p>
       <p class="meta">Direct live capture: <code>{direct_mode}</code></p>
       <p>Use this only on sites you own, administer, or are explicitly authorized to access. This flow is manual by design and stores structured facts instead of full page HTML.</p>
@@ -233,6 +235,9 @@ class LiveCaptureHandler(BaseHTTPRequestHandler):
                     "server_url": live_capture_base_url(),
                 },
             )
+            return
+        if self.path == "/api/status":
+            self._send_json(200, build_health_payload())
             return
         self._send_json(404, {"ok": False, "message": "Not found."})
 
@@ -315,6 +320,7 @@ class LiveCaptureHandler(BaseHTTPRequestHandler):
                 source_type="browser_live_capture",
                 schema_key=schema_key,
                 source_path_hint=source_path_hint,
+                exception=None,
                 payload={"capture_meta": capture_meta, "document_type": document_type},
             )
             self._send_json(
@@ -364,6 +370,7 @@ class LiveCaptureHandler(BaseHTTPRequestHandler):
                 source_type="browser_live_capture",
                 schema_key=schema_key,
                 source_path_hint=source_path_hint,
+                exception=None,
                 payload={"capture_meta": capture_meta, "payload": payload},
             )
             self._send_json(
@@ -379,10 +386,10 @@ class LiveCaptureHandler(BaseHTTPRequestHandler):
 
         response_message = save_result.get("message", "Capture stored successfully.")
         if direct_requested and destination != "parts":
-            response_message = _server_message(
+            response_message = (
                 response_message,
                 extra="Direct mode was downgraded to pending because WEVIKO_LIVE_CAPTURE_DIRECT_ENABLED is disabled.",
-            )
+            ) # type: ignore
 
         self._send_json(
             200,
@@ -409,14 +416,14 @@ class LiveCaptureHandler(BaseHTTPRequestHandler):
 def run_server() -> None:
     host = live_capture_host()
     port = live_capture_port()
-    server = ThreadingHTTPServer((host, port), LiveCaptureHandler)
-    print(f"[Live Capture] listening on {live_capture_base_url()}")
-    print(f"[Live Capture] allowed hosts: {', '.join(live_capture_allowed_hosts())}")
-    print(f"[Live Capture] direct mode: {'enabled' if live_capture_direct_enabled() else 'disabled'}")
+    server = ThreadingHTTPServer((host, port), LiveCaptureHandler) # type: ignore
+    logger.info(f"[Live Capture] listening on {live_capture_base_url()}")
+    logger.info(f"[Live Capture] allowed hosts: {', '.join(live_capture_allowed_hosts())}")
+    logger.info(f"[Live Capture] direct mode: {'enabled' if live_capture_direct_enabled() else 'disabled'}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[Live Capture] shutdown requested.")
+        logger.info("\n[Live Capture] shutdown requested.")
     finally:
         server.server_close()
 

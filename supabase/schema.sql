@@ -51,7 +51,8 @@ create table if not exists public.pending_data (
   status text not null default 'pending' check (status in ('pending', 'approved', 'rejected')),
   created_at timestamptz not null default now(),
   approved_at timestamptz,
-  rejected_at timestamptz
+  rejected_at timestamptz,
+  rejection_reason text
 );
 
 alter table public.pending_data add column if not exists part_number text;
@@ -66,6 +67,7 @@ alter table public.pending_data add column if not exists status text not null de
 alter table public.pending_data add column if not exists created_at timestamptz not null default now();
 alter table public.pending_data add column if not exists approved_at timestamptz;
 alter table public.pending_data add column if not exists rejected_at timestamptz;
+alter table public.pending_data add column if not exists rejection_reason text;
 
 create index if not exists idx_pending_data_status on public.pending_data (status);
 create index if not exists idx_pending_data_oem_brand on public.pending_data (oem_brand);
@@ -207,13 +209,65 @@ create table if not exists public.dead_letters (
   url text not null,
   error_reason text,
   resolved boolean not null default false,
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  schema_key text,
+  source_type text,
+  error_details jsonb
 );
+
+alter table public.dead_letters add column if not exists updated_at timestamptz not null default now();
+alter table public.dead_letters add column if not exists schema_key text;
+alter table public.dead_letters add column if not exists source_type text;
+alter table public.dead_letters add column if not exists error_details jsonb;
 
 create index if not exists idx_dead_letters_resolved on public.dead_letters (resolved);
 create index if not exists idx_dead_letters_created_at on public.dead_letters (created_at desc);
 
+-- 5. Scheduled Crawls
+create table if not exists public.scheduled_crawls (
+  id uuid primary key default gen_random_uuid(),
+  start_url text not null,
+  schema_key text not null,
+  schedule_interval text not null default 'once' check (schedule_interval in ('once', 'daily', 'weekly', 'monthly')),
+  next_run_at timestamptz not null default now(),
+  last_run_at timestamptz,
+  last_run_status text,
+  last_run_log text,
+  is_active boolean not null default true,
+  progress_log text,
+  current_progress integer default 0,
+  total_progress integer default 0,
+  num_workers integer,
+  max_urls integer,
+  discovery_max_pages integer,
+  discovery_max_matches integer,
+  discovery_max_depth integer,
+  product_path_hint text,
+  discovery_extra_path_hints jsonb default '[]'::jsonb,
+  route_watch_hints jsonb default '[]'::jsonb,
+  blocked_resource_types jsonb default '[]'::jsonb,
+  user_agent text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists idx_scheduled_crawls_next_run_at on public.scheduled_crawls (next_run_at);
+create index if not exists idx_scheduled_crawls_is_active on public.scheduled_crawls (is_active);
 -- 5. Crawl hash/cache log for the Playwright pipeline
+alter table public.scheduled_crawls add column if not exists num_workers integer;
+alter table public.scheduled_crawls add column if not exists progress_log text;
+alter table public.scheduled_crawls add column if not exists current_progress integer default 0;
+alter table public.scheduled_crawls add column if not exists total_progress integer default 0;
+alter table public.scheduled_crawls add column if not exists max_urls integer;
+alter table public.scheduled_crawls add column if not exists discovery_max_pages integer;
+alter table public.scheduled_crawls add column if not exists discovery_max_matches integer;
+alter table public.scheduled_crawls add column if not exists discovery_max_depth integer;
+alter table public.scheduled_crawls add column if not exists product_path_hint text;
+alter table public.scheduled_crawls add column if not exists discovery_extra_path_hints jsonb default '[]'::jsonb;
+alter table public.scheduled_crawls add column if not exists route_watch_hints jsonb default '[]'::jsonb;
+alter table public.scheduled_crawls add column if not exists blocked_resource_types jsonb default '[]'::jsonb;
+alter table public.scheduled_crawls add column if not exists user_agent text;
 create table if not exists public.crawling_logs (
   id uuid primary key default gen_random_uuid(),
   url text not null,

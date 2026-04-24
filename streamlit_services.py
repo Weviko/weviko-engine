@@ -4,29 +4,44 @@ import base64
 import hashlib
 import json
 import os
+import requests
 import re
+import traceback
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
-
+from dateutil.relativedelta import relativedelta
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
+from weviko_engine import run_crawler_sync
 from main import build_llm, build_supabase_client, invoke_llm_with_fallback
 
-
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
 load_dotenv()
 
 
 class VisionFactBundle(BaseModel):
     """Structured extraction result for uploaded automotive document images."""
 
-    part_number: str = Field(default="Unknown", description="Detected automotive part number.")
-    oem_brand: str = Field(default="", description="OEM brand associated with the part.")
-    schema_key: str = Field(default="", description="Internal schema key selected by the operator.")
-    source_path_hint: str = Field(default="", description="Source path hint selected by the operator.")
+    part_number: str = Field(
+        default="Unknown", description="Detected automotive part number."
+    )
+    oem_brand: str = Field(
+        default="", description="OEM brand associated with the part."
+    )
+    schema_key: str = Field(
+        default="", description="Internal schema key selected by the operator."
+    )
+    source_path_hint: str = Field(
+        default="", description="Source path hint selected by the operator."
+    )
     document_type: str = Field(default="Unknown", description="Detected document type.")
     summary: str = Field(default="", description="Short summary of the image contents.")
     extracted_facts: dict[str, Any] = Field(
@@ -42,14 +57,18 @@ class VisionFactBundle(BaseModel):
 class CrawlFactBundle(BaseModel):
     """Structured extraction result for crawled automotive text pages."""
 
-    part_number: str = Field(default="Unknown", description="Detected automotive part number.")
+    part_number: str = Field(
+        default="Unknown", description="Detected automotive part number."
+    )
     oem_brand: str = Field(default="", description="OEM brand or manufacturer.")
     schema_key: str = Field(default="", description="Internal schema key.")
     source_path_hint: str = Field(default="", description="Selected source path hint.")
     document_type: str = Field(default="Unknown", description="Detected document type.")
     title: str = Field(default="", description="Short title for the crawled page.")
     summary: str = Field(default="", description="Short summary for technicians.")
-    vehicle: dict[str, Any] = Field(default_factory=dict, description="Vehicle applicability metadata.")
+    vehicle: dict[str, Any] = Field(
+        default_factory=dict, description="Vehicle applicability metadata."
+    )
     compatibility: list[dict[str, Any]] = Field(
         default_factory=list,
         description="Vehicle compatibility entries when available.",
@@ -72,8 +91,12 @@ class TranslationBundle(BaseModel):
     """Multilingual translation package for a structured automotive payload."""
 
     ko: dict[str, Any] = Field(default_factory=dict, description="Korean JSON payload.")
-    en: dict[str, Any] = Field(default_factory=dict, description="English JSON payload.")
-    vn: dict[str, Any] = Field(default_factory=dict, description="Vietnamese JSON payload.")
+    en: dict[str, Any] = Field(
+        default_factory=dict, description="English JSON payload."
+    )
+    vn: dict[str, Any] = Field(
+        default_factory=dict, description="Vietnamese JSON payload."
+    )
     notes: str = Field(default="", description="Short translation notes or warnings.")
 
 
@@ -82,7 +105,10 @@ def _utc_now_iso() -> str:
 
 
 def _prompt_store_path() -> Path:
-    raw_path = os.getenv("WEVIKO_PROMPTS_FILE", "prompt_templates.json").strip() or "prompt_templates.json"
+    raw_path = (
+        os.getenv("WEVIKO_PROMPTS_FILE", "prompt_templates.json").strip()
+        or "prompt_templates.json"
+    )
     path = Path(raw_path)
     if not path.is_absolute():
         path = Path(__file__).resolve().parent / path
@@ -91,13 +117,6 @@ def _prompt_store_path() -> Path:
 
 def _clean_json_value(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False, default=str))
-
-
-def _safe_console_log(message: str) -> None:
-    try:
-        print(message)
-    except UnicodeEncodeError:
-        print(message.encode("unicode_escape").decode("ascii"))
 
 
 @lru_cache(maxsize=1)
@@ -119,19 +138,29 @@ def supabase_available() -> bool:
 
 
 def prompt_tables_name() -> str:
-    return os.getenv("WEVIKO_PROMPTS_TABLE", "system_prompts").strip() or "system_prompts"
+    return (
+        os.getenv("WEVIKO_PROMPTS_TABLE", "system_prompts").strip() or "system_prompts"
+    )
 
 
 def review_table_name() -> str:
-    return os.getenv("WEVIKO_REVIEW_TABLE", "review_decisions").strip() or "review_decisions"
+    return (
+        os.getenv("WEVIKO_REVIEW_TABLE", "review_decisions").strip()
+        or "review_decisions"
+    )
 
 
 def translation_table_name() -> str:
-    return os.getenv("WEVIKO_TRANSLATIONS_TABLE", "part_translations").strip() or "part_translations"
+    return (
+        os.getenv("WEVIKO_TRANSLATIONS_TABLE", "part_translations").strip()
+        or "part_translations"
+    )
 
 
 def vision_table_name() -> str:
-    return os.getenv("WEVIKO_VISION_TABLE", "vision_analysis").strip() or "vision_analysis"
+    return (
+        os.getenv("WEVIKO_VISION_TABLE", "vision_analysis").strip() or "vision_analysis"
+    )
 
 
 def parts_table_name() -> str:
@@ -139,7 +168,10 @@ def parts_table_name() -> str:
 
 
 def gsw_documents_table_name() -> str:
-    return os.getenv("WEVIKO_GSW_DOCUMENTS_TABLE", "gsw_documents").strip() or "gsw_documents"
+    return (
+        os.getenv("WEVIKO_GSW_DOCUMENTS_TABLE", "gsw_documents").strip()
+        or "gsw_documents"
+    )
 
 
 def pending_table_name() -> str:
@@ -151,7 +183,16 @@ def configs_table_name() -> str:
 
 
 def dead_letters_table_name() -> str:
-    return os.getenv("WEVIKO_DEAD_LETTERS_TABLE", "dead_letters").strip() or "dead_letters"
+    return (
+        os.getenv("WEVIKO_DEAD_LETTERS_TABLE", "dead_letters").strip() or "dead_letters"
+    )
+
+
+def scheduled_crawls_table_name() -> str:
+    return (
+        os.getenv("WEVIKO_SCHEDULED_CRAWLS_TABLE", "scheduled_crawls").strip()
+        or "scheduled_crawls"
+    )
 
 
 def load_prompt_templates(defaults: dict[str, str]) -> tuple[dict[str, str], str]:
@@ -176,7 +217,9 @@ def load_prompt_templates(defaults: dict[str, str]) -> tuple[dict[str, str], str
             response = client.table(prompt_tables_name()).select("*").execute()
             for row in getattr(response, "data", []) or []:
                 name = row.get("name") or row.get("prompt_name")
-                prompt_text = row.get("prompt_text") or row.get("prompt") or row.get("content")
+                prompt_text = (
+                    row.get("prompt_text") or row.get("prompt") or row.get("content")
+                )
                 if name and prompt_text:
                     prompts[str(name)] = str(prompt_text)
                     source = "supabase"
@@ -207,7 +250,11 @@ def load_config_prompts(defaults: dict[str, str]) -> tuple[dict[str, str], str]:
         return prompts, source
 
     try:
-        response = client.table(configs_table_name()).select("prompt_key,prompt_value").execute()
+        response = (  # type: ignore
+            client.table(configs_table_name())
+            .select("prompt_key,prompt_value")
+            .execute()
+        )
         for row in getattr(response, "data", []) or []:
             prompt_key = row.get("prompt_key")
             prompt_value = row.get("prompt_value")
@@ -215,7 +262,9 @@ def load_config_prompts(defaults: dict[str, str]) -> tuple[dict[str, str], str]:
                 prompts[str(prompt_key)] = str(prompt_value)
                 source = "supabase"
     except Exception as exc:
-        _safe_console_log(f"[Configs] prompt load failed. Falling back to local/default prompts: {exc}")
+        logger.warning(
+            f"[Configs] prompt load failed. Falling back to local/default prompts: {exc}"
+        )
         pass
 
     return prompts, source
@@ -254,7 +303,9 @@ def save_prompt_template(name: str, prompt_text: str) -> dict[str, Any]:
         result["source"] = "supabase"
         result["message"] = "Supabase와 로컬 파일에 저장되었습니다."
     except Exception as exc:
-        result["message"] = f"로컬 파일 저장은 성공했고, Supabase 저장은 실패했습니다: {exc}"
+        result["message"] = (
+            f"로컬 파일 저장은 성공했고, Supabase 저장은 실패했습니다: {exc}"
+        )
 
     return result
 
@@ -310,7 +361,9 @@ def save_config_prompt(prompt_key: str, prompt_text: str) -> dict[str, Any]:
         result["source"] = "supabase"
         result["message"] = "프롬프트를 Supabase와 로컬 파일에 저장했습니다."
     except Exception as exc:
-        result["message"] = f"로컬 파일 저장은 성공했고, Supabase 저장은 실패했습니다: {exc}"
+        result["message"] = (
+            f"로컬 파일 저장은 성공했고, Supabase 저장은 실패했습니다: {exc}"
+        )
 
     return result
 
@@ -347,9 +400,205 @@ def reset_prompt_templates(defaults: dict[str, str]) -> dict[str, Any]:
         result["source"] = "supabase"
         result["message"] = "기본 프롬프트를 Supabase와 로컬 파일에 복원했습니다."
     except Exception as exc:
-        result["message"] = f"로컬 파일 복원은 성공했고, Supabase 반영은 실패했습니다: {exc}"
+        result["message"] = (
+            f"로컬 파일 복원은 성공했고, Supabase 반영은 실패했습니다: {exc}"
+        )
 
     return result
+
+
+def create_scheduled_crawl(
+    start_url: str,
+    schema_key: str,
+    schedule_interval: str,
+    num_workers: int | None = None,
+    max_urls: int | None = None,
+    discovery_max_pages: int | None = None,
+    discovery_max_matches: int | None = None,
+    discovery_max_depth: int | None = None,
+    product_path_hint: str | None = None,
+    discovery_extra_path_hints: list[str] | None = None,
+    route_watch_hints: list[str] | None = None,
+    blocked_resource_types: list[str] | None = None,
+    user_agent: str | None = None,
+    next_run_at: datetime | None = None,
+) -> dict[str, Any]:
+    client = get_cached_supabase_client()
+    if client is None:
+        return {
+            "saved": False,
+            "message": "Supabase가 설정되지 않아 스케줄을 생성할 수 없습니다.",
+        }
+
+    try:
+        payload = {
+            "start_url": start_url,
+            "schema_key": schema_key,
+            "schedule_interval": schedule_interval,
+            "next_run_at": (next_run_at or datetime.now(timezone.utc)).isoformat(),
+            "is_active": True,
+            "progress_log": "",
+            "current_progress": 0,
+            "total_progress": 0,
+            "num_workers": num_workers,
+            "max_urls": max_urls,
+            "discovery_max_pages": discovery_max_pages,
+            "discovery_max_matches": discovery_max_matches,
+            "discovery_max_depth": discovery_max_depth,
+            "product_path_hint": product_path_hint,
+            "discovery_extra_path_hints": discovery_extra_path_hints,
+            "route_watch_hints": route_watch_hints,
+            "blocked_resource_types": blocked_resource_types,
+            "user_agent": user_agent,
+            "created_at": _utc_now_iso(),
+            "updated_at": _utc_now_iso(),
+        }
+        client.table(scheduled_crawls_table_name()).insert(payload).execute()
+        return {"saved": True, "message": "크롤링 스케줄이 성공적으로 생성되었습니다."}
+    except Exception as exc:
+        logger.error(f"스케줄 생성 실패: {exc}", exc_info=True)
+        return {"saved": False, "message": f"스케줄 생성 실패: {exc}"}
+
+
+def fetch_scheduled_crawls() -> list[dict[str, Any]]:
+    client = get_cached_supabase_client()
+    if client is None:
+        return []
+
+    try:
+        response = (
+            client.table(scheduled_crawls_table_name())
+            .select("*")
+            .order("next_run_at", desc=False)
+            .execute()
+        )
+        return list(getattr(response, "data", []) or [])
+    except Exception as exc:
+        logger.error(f"스케줄 조회 실패: {exc}", exc_info=True)
+        return []
+
+
+def delete_scheduled_crawl(schedule_id: Any) -> dict[str, Any]:
+    client = get_cached_supabase_client()
+    if client is None:
+        return {
+            "saved": False,
+            "message": "Supabase가 설정되지 않아 스케줄을 삭제할 수 없습니다.",
+        }
+
+    try:
+        client.table(scheduled_crawls_table_name()).delete().eq(
+            "id", schedule_id
+        ).execute()
+        return {"saved": True, "message": "스케줄이 성공적으로 삭제되었습니다."}
+    except Exception as exc:
+        logger.error(f"스케줄 삭제 실패: {exc}", exc_info=True)
+        return {"saved": False, "message": f"스케줄 삭제 실패: {exc}"}
+
+
+def _calculate_next_run_time(schedule_interval: str) -> datetime:
+    now = datetime.now(timezone.utc)
+    if schedule_interval == "daily":
+        return now + relativedelta(days=1)
+    elif schedule_interval == "weekly":
+        return now + relativedelta(weeks=1)
+    elif schedule_interval == "monthly":
+        return now + relativedelta(months=1)
+    return now  # For 'once' or unknown, run immediately
+
+
+def execute_scheduled_crawl_job(schedule_id: Any) -> dict[str, Any]:
+    client = get_cached_supabase_client()
+    if client is None:
+        return {
+            "success": False,
+            "message": "Supabase가 설정되지 않아 스케줄을 실행할 수 없습니다.",
+        }
+
+    try:
+        response = (
+            client.table(scheduled_crawls_table_name())
+            .select("*")
+            .eq("id", schedule_id)
+            .single()
+            .execute()
+        )
+        schedule_config = response.data
+        if not schedule_config:
+            return {"success": False, "message": "스케줄을 찾을 수 없습니다."}
+
+        # Update status to running
+        client.table(scheduled_crawls_table_name()).update(  # type: ignore
+            {"last_run_status": "running", "updated_at": _utc_now_iso()}
+        ).eq("id", schedule_id).execute()
+
+        # Call run_factory (this will block the Streamlit UI)
+        from main import run_factory  # Import here to avoid circular dependency
+
+        run_result = run_factory(
+            start_url=schedule_config["start_url"],
+            schema_key=schedule_config["schema_key"],
+            source_type="scheduled_crawl",
+            # Other parameters can be added to scheduled_crawls table if needed
+        )
+
+        # Update status after run
+        is_active = schedule_config["is_active"]
+        if schedule_config["schedule_interval"] == "once":
+            next_run = datetime.max.replace(
+                tzinfo=timezone.utc
+            )  # Set to a very distant future
+            is_active = False
+        else:
+            next_run = _calculate_next_run_time(schedule_config["schedule_interval"])
+        final_status = (
+            "success" if run_result.total_queued_for_processing > 0 else "failed"
+        )
+        final_log = f"Queued: {run_result.total_queued_for_processing}, Processed: {run_result.total_processed_by_ai}"
+
+        client.table(scheduled_crawls_table_name()).update(  # type: ignore
+            {
+                "last_run_at": _utc_now_iso(),
+                "last_run_status": final_status,
+                "last_run_log": final_log,
+                "next_run_at": next_run.isoformat(),
+                "is_active": is_active,
+                "updated_at": _utc_now_iso(),
+            }
+        ).eq("id", schedule_id).execute()
+
+        return {"success": True, "message": f"스케줄 실행 완료: {final_log}"}
+    except Exception as exc:
+        logger.error(f"스케줄 즉시 실행 실패: {exc}", exc_info=True)
+        client.table(scheduled_crawls_table_name()).update(  # type: ignore
+            {
+                "last_run_status": "failed",
+                "last_run_log": str(exc),
+                "updated_at": _utc_now_iso(),
+            }
+        ).eq("id", schedule_id).execute()
+        return {"success": False, "message": f"스케줄 즉시 실행 실패: {exc}"}
+
+
+def fetch_due_scheduled_crawls(limit: int = 5) -> list[dict[str, Any]]:
+    client = get_cached_supabase_client()
+    if client is None:
+        return []
+
+    try:
+        response = (
+            client.table(scheduled_crawls_table_name())
+            .select("*")
+            .eq("is_active", True)
+            .lte("next_run_at", _utc_now_iso())
+            .order("next_run_at", desc=False)
+            .limit(limit)
+            .execute()
+        )
+        return list(getattr(response, "data", []) or [])
+    except Exception as exc:
+        logger.error(f"기한이 된 스케줄 조회 실패: {exc}", exc_info=True)
+        return []
 
 
 def _insert_remote(table_name: str, payload: dict[str, Any]) -> tuple[bool, str]:
@@ -372,11 +621,17 @@ def log_dead_letter(
     source_type: str = "",
     schema_key: str = "",
     source_path_hint: str = "",
+    # New parameter `payload` is already in the function signature, but adding it here for clarity.
     payload: dict[str, Any] | None = None,
+    exception: Exception | None = None,  # New parameter
+    extra_details: dict[str, Any] | None = None,  # New parameter
 ) -> dict[str, Any]:
     primary_url = str(url or final_url).strip()
     if not primary_url:
-        return {"saved": False, "message": "dead_letters entry skipped because URL is missing."}
+        return {  # type: ignore
+            "saved": False,
+            "message": "dead_letters entry skipped because URL is missing.",
+        }
 
     metadata_parts: list[str] = []
     if final_url and final_url.strip() and final_url.strip() != primary_url:
@@ -388,8 +643,29 @@ def log_dead_letter(
     if source_path_hint:
         metadata_parts.append(f"path_hint={source_path_hint}")
     if payload:
-        payload_preview = json.dumps(_clean_json_value(payload), ensure_ascii=False)[:800]
-        metadata_parts.append(f"payload={payload_preview}")
+        # Store a sanitized/limited version of the payload to avoid excessive size
+        payload_snapshot = {
+            k: v
+            for k, v in payload.items()
+            if k not in ["raw_response", "scraped_text"]
+        }
+        # Limit size of payload_snapshot if it gets too big
+        if len(json.dumps(payload_snapshot)) > 5000:
+            payload_snapshot = {
+                "_truncated": True,
+                "part_number": payload.get("part_number"),
+                "schema_key": payload.get("schema_key"),
+            }
+
+    full_error_details: dict[str, Any] = {}
+    if extra_details:
+        full_error_details.update(extra_details)
+    if exception:
+        full_error_details["traceback"] = traceback.format_exc() if exception else None
+        full_error_details["exception_type"] = type(exception).__name__
+        full_error_details["exception_message"] = str(exception)
+    if payload_snapshot:  # Use the potentially truncated snapshot
+        full_error_details["payload_snapshot"] = payload_snapshot
 
     reason = str(error_reason or "unknown_error").strip()
     if metadata_parts:
@@ -401,7 +677,11 @@ def log_dead_letter(
             "url": primary_url,
             "error_reason": reason[:3000],
             "resolved": False,
+            "updated_at": _utc_now_iso(),
             "created_at": _utc_now_iso(),
+            "schema_key": schema_key,
+            "source_type": source_type,
+            "error_details": full_error_details,  # New column
         },
     )
     return {"saved": saved, "message": message}
@@ -439,7 +719,9 @@ def _parse_json_text(raw_text: str) -> dict[str, Any]:
 def _response_to_payload(response: Any) -> dict[str, Any]:
     if isinstance(response, BaseModel):
         return response.model_dump()
-    return _parse_json_text(_extract_response_text(getattr(response, "content", response)))
+    return _parse_json_text(
+        _extract_response_text(getattr(response, "content", response))
+    )
 
 
 def _guess_scraped_text_part_number(scraped_text: str) -> str:
@@ -452,7 +734,9 @@ def _guess_scraped_text_part_number(scraped_text: str) -> str:
             continue
         if not any(char.isdigit() for char in cleaned):
             continue
-        candidates.append((sum(char.isdigit() for char in cleaned) + len(cleaned), cleaned))
+        candidates.append(
+            (sum(char.isdigit() for char in cleaned) + len(cleaned), cleaned)
+        )
     candidates.sort(reverse=True)
     return candidates[0][1] if candidates else ""
 
@@ -473,11 +757,21 @@ def _build_local_text_fallback_payload(
     extra_metadata: dict[str, Any] | None = None,
     fallback_reason: str = "llm_unavailable",
 ) -> dict[str, Any]:
-    lines = [line.strip() for line in str(scraped_text or "").splitlines() if line.strip()]
-    visible_lines = [line for line in lines if not line.startswith("[") and "]" not in line[:40]]
+    lines = [
+        line.strip() for line in str(scraped_text or "").splitlines() if line.strip()
+    ]
+    visible_lines = [
+        line for line in lines if not line.startswith("[") and "]" not in line[:40]
+    ]
     page_title = str((extra_metadata or {}).get("page_title") or "").strip()
-    title = page_title or (visible_lines[0] if visible_lines else document_type or doc_type_key or "Captured page")
-    summary_source = " ".join(visible_lines[:8]).strip() or str(scraped_text or "").strip()
+    title = page_title or (
+        visible_lines[0]
+        if visible_lines
+        else document_type or doc_type_key or "Captured page"
+    )
+    summary_source = (
+        " ".join(visible_lines[:8]).strip() or str(scraped_text or "").strip()
+    )
     summary = re.sub(r"\s+", " ", summary_source)[:320].strip()
     guessed_part_number = _guess_scraped_text_part_number(scraped_text)
     resolved_part_number = resolve_storage_part_number(
@@ -494,7 +788,8 @@ def _build_local_text_fallback_payload(
         "document_type": document_type or doc_type_key,
         "market": market,
         "title": title[:180],
-        "summary": summary or "Captured page stored without Gemini extraction. Manual review is required.",
+        "summary": summary
+        or "Captured page stored without Gemini extraction. Manual review is required.",
         "vehicle": {},
         "compatibility": [],
         "specifications": {},
@@ -508,7 +803,9 @@ def _build_local_text_fallback_payload(
             "Gemini structured extraction is unavailable, so this record was created in local fallback mode.",
         ],
         "analysis_mode": (
-            "local_fallback_no_llm" if fallback_reason == "llm_unavailable" else "local_fallback_after_llm_error"
+            "local_fallback_no_llm"
+            if fallback_reason == "llm_unavailable"
+            else "local_fallback_after_llm_error"
         ),
         "source_url": source_url,
         "compressed_chars": len(scraped_text or ""),
@@ -523,7 +820,11 @@ def _build_local_text_fallback_payload(
         operator_identifier=operator_identifier,
     )
     if extra_metadata:
-        capture_context = {key: value for key, value in extra_metadata.items() if value not in {"", None, [], {}}}
+        capture_context = {
+            key: value
+            for key, value in extra_metadata.items()
+            if value not in {"", None, [], {}}
+        }
         if capture_context:
             payload["capture_context"] = capture_context
         capture_type = str(extra_metadata.get("capture_type") or "").strip()
@@ -637,7 +938,9 @@ def apply_input_context_to_payload(
             payload["part_number"] = cleaned_part_hint
     else:
         if not schema_requires_part_number(schema_key):
-            if is_placeholder_identifier(current_part_number) or looks_like_context_label(
+            if is_placeholder_identifier(
+                current_part_number
+            ) or looks_like_context_label(
                 current_part_number,
                 vehicle_hint=cleaned_vehicle_hint,
                 system_hint=cleaned_system_hint,
@@ -663,7 +966,8 @@ def _extract_vehicle_identifier_examples(raw_text: str) -> dict[str, list[str]]:
         set(
             match
             for match in re.findall(r"\b[A-Z0-9-]{4,12}\b", upper_text)
-            if any(char.isdigit() for char in match) and any(char.isalpha() for char in match)
+            if any(char.isdigit() for char in match)
+            and any(char.isalpha() for char in match)
         )
     )
     return {
@@ -784,7 +1088,9 @@ def assess_analysis_quality(payload: dict[str, Any]) -> dict[str, Any]:
         score += 10
     if title:
         score += 4
-    if schema_requires_part_number(schema_key) and is_placeholder_identifier(part_number):
+    if schema_requires_part_number(schema_key) and is_placeholder_identifier(
+        part_number
+    ):
         reasons.append("placeholder_part_number")
         score -= 20
     elif schema_requires_part_number(schema_key):
@@ -859,7 +1165,10 @@ def refine_vision_result_and_save(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     llm = get_cached_llm()
     if llm is None:
-        return analysis_payload, {"saved": False, "message": "Gemini가 설정되지 않아 재구조화를 진행할 수 없습니다."}
+        return analysis_payload, {
+            "saved": False,
+            "message": "Gemini가 설정되지 않아 재구조화를 진행할 수 없습니다.",
+        }
 
     raw_source = str(
         analysis_payload.get("raw_response")
@@ -867,7 +1176,10 @@ def refine_vision_result_and_save(
         or json.dumps(analysis_payload, ensure_ascii=False, indent=2)
     ).strip()
     if not raw_source:
-        return analysis_payload, {"saved": False, "message": "재구조화할 원본 설명문이 없습니다."}
+        return analysis_payload, {
+            "saved": False,
+            "message": "재구조화할 원본 설명문이 없습니다.",
+        }
 
     refinement_prompt = (
         f"{get_system_prompt(schema_key, '자동차 자료를 구조화 JSON으로 변환하세요.')}\n\n"
@@ -895,23 +1207,36 @@ def refine_vision_result_and_save(
 
     try:
         response = invoke_llm_with_fallback([message])
-        refined_payload = _parse_json_text(_extract_response_text(getattr(response, "content", response)))
+        refined_payload = _parse_json_text(
+            _extract_response_text(getattr(response, "content", response))
+        )
     except Exception as exc:
-        return analysis_payload, {"saved": False, "message": f"재구조화 중 Gemini 호출 실패: {exc}"}
+        return analysis_payload, {
+            "saved": False,
+            "message": f"재구조화 중 Gemini 호출 실패: {exc}",
+        }
 
     if schema_key == "path_vehicle_id":
         examples = _extract_vehicle_identifier_examples(raw_source)
         if examples["vin_examples"] or examples["engine_or_code_examples"]:
-            vehicle_identifier_facts = refined_payload.setdefault("vehicle_identifier_facts", {})
+            vehicle_identifier_facts = refined_payload.setdefault(
+                "vehicle_identifier_facts", {}
+            )
             for key, values in examples.items():
                 if values and key not in vehicle_identifier_facts:
                     vehicle_identifier_facts[key] = values
 
     refined_payload.setdefault(
         "part_number",
-        "UNKNOWN" if not schema_requires_part_number(schema_key) else (part_number_hint or "Unknown"),
+        (
+            "UNKNOWN"
+            if not schema_requires_part_number(schema_key)
+            else (part_number_hint or "Unknown")
+        ),
     )
-    if not schema_requires_part_number(schema_key) and is_placeholder_identifier(refined_payload.get("part_number")):
+    if not schema_requires_part_number(schema_key) and is_placeholder_identifier(
+        refined_payload.get("part_number")
+    ):
         refined_payload["part_number"] = "UNKNOWN"
     refined_payload.setdefault("oem_brand", oem_brand)
     refined_payload.setdefault("schema_key", schema_key)
@@ -945,18 +1270,26 @@ def refine_vision_result_and_save(
     _insert_remote(
         vision_table_name(),
         {
-            "part_number": refined_payload.get("part_number", part_number_hint or "Unknown"),
+            "part_number": refined_payload.get(
+                "part_number", part_number_hint or "Unknown"
+            ),
             "oem_brand": refined_payload.get("oem_brand", oem_brand),
             "schema_key": refined_payload.get("schema_key", schema_key),
-            "source_path_hint": refined_payload.get("source_path_hint", source_path_hint),
-            "document_type": refined_payload.get("document_type", document_type or "Unknown"),
+            "source_path_hint": refined_payload.get(
+                "source_path_hint", source_path_hint
+            ),
+            "document_type": refined_payload.get(
+                "document_type", document_type or "Unknown"
+            ),
             "analysis": refined_payload,
             "created_at": _utc_now_iso(),
         },
     )
 
     pending_payload = {
-        "part_number": refined_payload.get("part_number", part_number_hint or "Unknown"),
+        "part_number": refined_payload.get(
+            "part_number", part_number_hint or "Unknown"
+        ),
         "oem_brand": refined_payload.get("oem_brand", oem_brand),
         "schema_key": refined_payload.get("schema_key", schema_key),
         "source_path_hint": refined_payload.get("source_path_hint", source_path_hint),
@@ -990,18 +1323,34 @@ def build_gsw_document_record(
     fallback_part_number: str = "",
 ) -> dict[str, Any]:
     schema_key = str(payload.get("schema_key") or fallback_schema_key or "").strip()
-    document_type = str(payload.get("document_type") or fallback_document_type or schema_key or "").strip()
-    source_path_hint = str(payload.get("source_path_hint") or fallback_source_path_hint or "").strip()
+    document_type = str(
+        payload.get("document_type") or fallback_document_type or schema_key or ""
+    ).strip()
+    source_path_hint = str(
+        payload.get("source_path_hint") or fallback_source_path_hint or ""
+    ).strip()
     oem_brand = str(payload.get("oem_brand") or fallback_oem_brand or "Hyundai").strip()
     market = str(payload.get("market") or fallback_market or "GLOBAL").strip()
-    part_number = str(payload.get("part_number") or fallback_part_number or "UNKNOWN").strip()
-    if not schema_requires_part_number(schema_key) and is_placeholder_identifier(part_number):
+    part_number = str(
+        payload.get("part_number") or fallback_part_number or "UNKNOWN"
+    ).strip()
+    if not schema_requires_part_number(schema_key) and is_placeholder_identifier(
+        part_number
+    ):
         part_number = "UNKNOWN"
 
     vehicle = payload.get("vehicle") if isinstance(payload.get("vehicle"), dict) else {}
-    input_context = payload.get("input_context") if isinstance(payload.get("input_context"), dict) else {}
-    inferred_model, inferred_year = _split_vehicle_hint(str(input_context.get("vehicle_hint") or ""))
-    breadcrumb_path = _string_list(payload.get("breadcrumbs") or payload.get("breadcrumb_path") or [])
+    input_context = (
+        payload.get("input_context")
+        if isinstance(payload.get("input_context"), dict)
+        else {}
+    )
+    inferred_model, inferred_year = _split_vehicle_hint(
+        str(input_context.get("vehicle_hint") or "")
+    )
+    breadcrumb_path = _string_list(
+        payload.get("breadcrumbs") or payload.get("breadcrumb_path") or []
+    )
     breadcrumb_text = " > ".join(breadcrumb_path)
     title = str(
         payload.get("title")
@@ -1011,7 +1360,10 @@ def build_gsw_document_record(
         or document_type
         or schema_key
     ).strip()
-    menu_family = str(payload.get("menu_family") or (breadcrumb_path[0] if breadcrumb_path else document_type)).strip()
+    menu_family = str(
+        payload.get("menu_family")
+        or (breadcrumb_path[0] if breadcrumb_path else document_type)
+    ).strip()
     summary = str(payload.get("summary") or "").strip()
 
     fingerprint_source = {
@@ -1025,7 +1377,9 @@ def build_gsw_document_record(
         "source_url": source_url,
     }
     source_fingerprint = hashlib.sha256(
-        json.dumps(fingerprint_source, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        json.dumps(fingerprint_source, ensure_ascii=False, sort_keys=True).encode(
+            "utf-8"
+        )
     ).hexdigest()
 
     return {
@@ -1043,10 +1397,18 @@ def build_gsw_document_record(
             or input_context.get("vehicle_hint")
             or ""
         ).strip(),
-        "vehicle_year": str(vehicle.get("year") or payload.get("year") or inferred_year or "").strip(),
-        "vehicle_trim": str(vehicle.get("trim") or payload.get("vehicle_trim") or "").strip(),
-        "engine_code": str(vehicle.get("engine") or payload.get("engine_code") or "").strip(),
-        "transmission_code": str(vehicle.get("transmission") or payload.get("transmission_code") or "").strip(),
+        "vehicle_year": str(
+            vehicle.get("year") or payload.get("year") or inferred_year or ""
+        ).strip(),
+        "vehicle_trim": str(
+            vehicle.get("trim") or payload.get("vehicle_trim") or ""
+        ).strip(),
+        "engine_code": str(
+            vehicle.get("engine") or payload.get("engine_code") or ""
+        ).strip(),
+        "transmission_code": str(
+            vehicle.get("transmission") or payload.get("transmission_code") or ""
+        ).strip(),
         "menu_family": menu_family,
         "schema_key": schema_key,
         "document_type": document_type,
@@ -1057,7 +1419,9 @@ def build_gsw_document_record(
         "source_path_hint": source_path_hint,
         "capture_type": str(payload.get("capture_type") or source_type).strip(),
         "source_type": source_type,
-        "page_ref": str(payload.get("page_ref") or payload.get("page_number") or "").strip(),
+        "page_ref": str(
+            payload.get("page_ref") or payload.get("page_number") or ""
+        ).strip(),
         "summary": summary,
         "document_payload": payload,
         "status": status,
@@ -1080,7 +1444,10 @@ def save_gsw_document(
 ) -> dict[str, Any]:
     client = get_cached_supabase_client()
     if client is None:
-        return {"saved": False, "message": "Supabase가 설정되지 않아 gsw_documents 저장을 건너뜁니다."}
+        return {
+            "saved": False,
+            "message": "Supabase가 설정되지 않아 gsw_documents 저장을 건너뜁니다.",
+        }
 
     record = build_gsw_document_record(
         payload,
@@ -1095,14 +1462,82 @@ def save_gsw_document(
         fallback_part_number=fallback_part_number,
     )
 
+    # Check for semantic duplicates before upserting
+    existing_id, existing_fingerprint = check_for_semantic_gsw_duplicate(payload)
+    if existing_id and existing_fingerprint != record["source_fingerprint"]:
+        # Semantic duplicate found with different content, log and skip
+        log_dead_letter(
+            source_url,
+            f"semantic_duplicate_gsw: Existing ID {existing_id} with different content.",
+            final_url=source_url,
+            source_type=source_type,
+            schema_key=record["schema_key"],
+            source_path_hint=record["source_path_hint"],
+            payload=payload,
+            extra_details={
+                "existing_gsw_id": existing_id,
+                "existing_fingerprint": existing_fingerprint,
+            },
+        )
+        return {
+            "saved": False,
+            "message": f"의미론적 중복으로 인해 gsw_documents 저장을 건너뛰었습니다 (기존 ID: {existing_id}).",
+            "record": record,
+        }
+
     try:
         client.table(gsw_documents_table_name()).upsert(
             _clean_json_value(record),
             on_conflict="source_fingerprint",
         ).execute()
-        return {"saved": True, "message": "gsw_documents 마스터에 반영했습니다.", "record": record}
+        return {
+            "saved": True,
+            "message": "gsw_documents 마스터에 반영했습니다.",
+            "record": record,
+        }
     except Exception as exc:
-        return {"saved": False, "message": f"gsw_documents 저장 실패: {exc}", "record": record}
+        return {
+            "saved": False,
+            "message": f"gsw_documents 저장 실패: {exc}",
+            "record": record,
+        }
+
+
+def check_for_semantic_gsw_duplicate(
+    payload: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """
+    Checks if a GSW document with the same part_number, oem_brand, and schema_key already exists.
+    Returns (existing_id, existing_source_fingerprint) if found, otherwise (None, None).
+    """
+    client = get_cached_supabase_client()
+    if client is None:
+        return None, None
+
+    part_number = str(payload.get("part_number", "")).strip()
+    oem_brand = str(payload.get("oem_brand", "")).strip()
+    schema_key = str(payload.get("schema_key", "")).strip()
+
+    # Only perform semantic check if part_number is meaningful
+    if is_placeholder_identifier(part_number) or not part_number:
+        return None, None
+
+    try:
+        response = (
+            client.table(gsw_documents_table_name())
+            .select("id, source_fingerprint")
+            .eq("part_number", part_number)
+            .eq("oem_brand", oem_brand)
+            .eq("schema_key", schema_key)
+            .limit(1)
+            .execute()
+        )
+        if response.data:
+            return response.data[0]["id"], response.data[0]["source_fingerprint"]
+    except Exception as exc:
+        logger.error(f"Semantic GSW duplicate check failed: {exc}", exc_info=True)
+
+    return None, None
 
 
 def process_vision_and_save(
@@ -1146,11 +1581,16 @@ def process_vision_and_save(
         msg = HumanMessage(
             content=[
                 {"type": "text", "text": system_prompt},
-                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{file_b64}"}},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{file_b64}"},
+                },
             ]
         )
         try:
-            response = invoke_llm_with_fallback([msg], structured_schema=VisionFactBundle)
+            response = invoke_llm_with_fallback(
+                [msg], structured_schema=VisionFactBundle
+            )
             payload = _response_to_payload(response)
             payload.setdefault("part_number", part_num or "Unknown")
             payload.setdefault("oem_brand", oem_brand)
@@ -1285,7 +1725,9 @@ def process_scraped_text_and_save(
         )
     else:
         try:
-            response = invoke_llm_with_fallback([msg], structured_schema=CrawlFactBundle)
+            response = invoke_llm_with_fallback(
+                [msg], structured_schema=CrawlFactBundle
+            )
             payload = _response_to_payload(response)
             payload["part_number"] = resolve_storage_part_number(
                 doc_type_key,
@@ -1409,7 +1851,11 @@ def process_scraped_text_and_save(
             "message": "수집 결과를 gsw_documents와 검수 대기열에 저장했습니다.",
         }
     except Exception as exc:
-        return payload, {"saved": False, "destination": "none", "message": f"저장 실패: {exc}"}
+        return payload, {
+            "saved": False,
+            "destination": "none",
+            "message": f"저장 실패: {exc}",
+        }
 
 
 def analyze_uploaded_image(
@@ -1520,7 +1966,8 @@ def enqueue_pending_vision_result(
         "part_number": part_number or analysis_payload.get("part_number", "Unknown"),
         "oem_brand": oem_brand or analysis_payload.get("oem_brand", ""),
         "schema_key": schema_key or analysis_payload.get("schema_key", ""),
-        "source_path_hint": source_path_hint or analysis_payload.get("source_path_hint", ""),
+        "source_path_hint": source_path_hint
+        or analysis_payload.get("source_path_hint", ""),
         "market": market,
         "document_type": document_type,
         "source_type": source_type,
@@ -1624,9 +2071,173 @@ def fetch_pending_items(limit: int = 20) -> list[dict[str, Any]]:
             .execute()
         )
         return list(getattr(response, "data", []) or [])
-    except Exception as exc:
-        _safe_console_log(f"[Pending] fetch failed: {exc}")
+    except Exception as exc:  # type: ignore
+        logger.error(f"[DLQ] fetch failed: {exc}")
         return []
+
+
+def fetch_rejected_items(limit: int = 50) -> list[dict[str, Any]]:
+    client = get_cached_supabase_client()
+    if client is None:
+        return []
+
+    try:
+        response = (  # type: ignore
+            client.table(pending_table_name())
+            .select("*")
+            .eq("status", "rejected")
+            .order("rejected_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return list(getattr(response, "data", []) or [])
+    except Exception as exc:  # type: ignore
+        logger.error(f"[Rejected] fetch failed: {exc}")
+        return []
+
+
+def requeue_rejected_item(item_id: Any) -> dict[str, Any]:
+    """Moves a rejected item back to the pending queue."""
+    client = get_cached_supabase_client()
+    if client is None:
+        return {
+            "saved": False,
+            "message": "Supabase가 설정되지 않아 항목을 되돌릴 수 없습니다.",
+        }
+
+    try:
+        client.table(pending_table_name()).update(
+            {
+                "status": "pending",
+                "rejected_at": None,
+                "rejection_reason": None,
+            }
+        ).eq("id", item_id).execute()
+        return {
+            "saved": True,
+            "message": "반려된 항목을 검수 대기열로 되돌렸습니다.",
+        }
+    except Exception as exc:  # type: ignore
+        return {
+            "saved": False,
+            "message": f"항목 되돌리기 실패: {exc}",
+        }
+
+
+def delete_pending_item(item_id: Any) -> dict[str, Any]:
+    """Permanently deletes an item from the pending_data table."""
+    client = get_cached_supabase_client()
+    if client is None:
+        return {
+            "saved": False,
+            "message": "Supabase가 설정되지 않아 항목을 삭제할 수 없습니다.",
+        }
+
+    try:
+        client.table(pending_table_name()).delete().eq("id", item_id).execute()
+        return {"saved": True, "message": "항목을 영구적으로 삭제했습니다."}
+    except Exception as exc:  # type: ignore
+        return {
+            "saved": False,
+            "message": f"항목 삭제 실패: {exc}",
+        }
+
+
+def get_live_capture_server_status() -> dict[str, Any] | None:
+    """Fetches the status of the live capture server."""
+    server_host = os.getenv("WEVIKO_LIVE_CAPTURE_HOST", "127.0.0.1")
+    server_port = int(os.getenv("WEVIKO_LIVE_CAPTURE_PORT", "8765"))
+    server_scheme = os.getenv("WEVIKO_LIVE_CAPTURE_SCHEME", "http")
+    server_url = f"{server_scheme}://{server_host}:{server_port}/api/status"
+
+    try:
+        response = requests.get(server_url, timeout=5)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.ConnectionError:
+        logger.warning(
+            f"Live Capture Server is not running or unreachable at {server_url}"
+        )
+        return None
+    except requests.exceptions.Timeout:
+        logger.warning(f"Live Capture Server connection timed out at {server_url}")
+        return None
+    except Exception as exc:
+        logger.error(
+            f"Failed to fetch Live Capture Server status from {server_url}: {exc}"
+        )
+        return None
+
+
+def fetch_recent_live_captures(limit: int = 10) -> list[dict[str, Any]]:
+    """Fetches recent pending_data items from live capture."""
+    client = get_cached_supabase_client()
+    if client is None:
+        return []
+
+    try:
+        response = (
+            client.table(pending_table_name())
+            .select("*")
+            .eq("source_type", "browser_live_capture")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return list(getattr(response, "data", []) or [])
+    except Exception as exc:
+        logger.error(f"[Live Capture] fetch recent captures failed: {exc}")
+        return []
+
+
+def bulk_requeue_rejected_items(item_ids: list[Any]) -> dict[str, Any]:
+    """Moves multiple rejected items back to the pending queue."""
+    client = get_cached_supabase_client()
+    if client is None:
+        return {
+            "saved": False,
+            "message": "Supabase가 설정되지 않아 항목을 되돌릴 수 없습니다.",
+        }
+
+    try:
+        client.table(pending_table_name()).update(
+            {
+                "status": "pending",
+                "rejected_at": None,
+                "rejection_reason": None,
+            }
+        ).in_("id", item_ids).execute()
+        return {
+            "saved": True,
+            "message": f"{len(item_ids)}개 반려 항목을 검수 대기열로 되돌렸습니다.",
+        }
+    except Exception as exc:  # type: ignore
+        return {
+            "saved": False,
+            "message": f"항목 되돌리기 실패: {exc}",
+        }
+
+
+def bulk_delete_pending_items(item_ids: list[Any]) -> dict[str, Any]:
+    """Permanently deletes multiple items from the pending_data table."""
+    client = get_cached_supabase_client()
+    if client is None:
+        return {
+            "saved": False,
+            "message": "Supabase가 설정되지 않아 항목을 삭제할 수 없습니다.",
+        }
+
+    try:
+        client.table(pending_table_name()).delete().in_("id", item_ids).execute()
+        return {
+            "saved": True,
+            "message": f"{len(item_ids)}개 항목을 영구적으로 삭제했습니다.",
+        }
+    except Exception as exc:  # type: ignore
+        return {
+            "saved": False,
+            "message": f"항목 삭제 실패: {exc}",
+        }
 
 
 def approve_pending_item(
@@ -1643,19 +2254,25 @@ def approve_pending_item(
         }
 
     try:
-        resolved_part_number = edited_payload.get("part_number") or item.get("part_number") or "Unknown"
-        resolved_oem_brand = edited_payload.get("oem_brand") or item.get("oem_brand", "")
-        resolved_schema_key = edited_payload.get("schema_key") or item.get("schema_key", "")
-        resolved_source_path_hint = (
-            edited_payload.get("source_path_hint")
-            or item.get("source_path_hint", "")
+        resolved_part_number = (
+            edited_payload.get("part_number") or item.get("part_number") or "Unknown"
+        )
+        resolved_oem_brand = edited_payload.get("oem_brand") or item.get(
+            "oem_brand", ""
+        )
+        resolved_schema_key = edited_payload.get("schema_key") or item.get(
+            "schema_key", ""
+        )
+        resolved_source_path_hint = edited_payload.get("source_path_hint") or item.get(
+            "source_path_hint", ""
         )
         resolved_market = edited_payload.get("market") or item.get("market", "GLOBAL")
-        resolved_document_type = (
-            edited_payload.get("document_type")
-            or item.get("document_type", "")
+        resolved_document_type = edited_payload.get("document_type") or item.get(
+            "document_type", ""
         )
-        resolved_source_type = edited_payload.get("source_type") or item.get("source_type", "")
+        resolved_source_type = edited_payload.get("source_type") or item.get(
+            "source_type", ""
+        )
         gsw_result = save_gsw_document(
             edited_payload,
             source_type=resolved_source_type or "review_approved",
@@ -1671,7 +2288,9 @@ def approve_pending_item(
             raise RuntimeError(gsw_result["message"])
 
         part_saved = False
-        if schema_requires_part_number(resolved_schema_key) and not is_placeholder_identifier(resolved_part_number):
+        if schema_requires_part_number(
+            resolved_schema_key
+        ) and not is_placeholder_identifier(resolved_part_number):
             client.table(parts_table_name()).upsert(
                 {
                     "part_number": resolved_part_number,
@@ -1711,19 +2330,21 @@ def approve_pending_item(
         if part_saved:
             message_parts.append("parts 테이블에도 반영했습니다.")
         else:
-            message_parts.append("이번 문서는 GSW 문서형으로 분류되어 parts 업서는 건너뛰었습니다.")
+            message_parts.append(
+                "이번 문서는 GSW 문서형으로 분류되어 parts 업서는 건너뛰었습니다."
+            )
         return {
             "saved": True,
             "message": " ".join(message_parts),
         }
-    except Exception as exc:
+    except Exception as exc:  # type: ignore
         return {
             "saved": False,
             "message": f"승인 이관 실패: {exc}",
         }
 
 
-def reject_pending_item(item_id: Any) -> dict[str, Any]:
+def reject_pending_item(item_id: Any, rejection_reason: str = "") -> dict[str, Any]:
     client = get_cached_supabase_client()
     if client is None:
         return {
@@ -1736,13 +2357,14 @@ def reject_pending_item(item_id: Any) -> dict[str, Any]:
             {
                 "status": "rejected",
                 "rejected_at": _utc_now_iso(),
+                "rejection_reason": rejection_reason,
             }
         ).eq("id", item_id).execute()
         return {
             "saved": True,
             "message": "pending_data 상태를 rejected로 갱신했습니다.",
         }
-    except Exception as exc:
+    except Exception as exc:  # type: ignore
         return {
             "saved": False,
             "message": f"반려 처리 실패: {exc}",
@@ -1763,12 +2385,14 @@ def fetch_untranslated_parts(limit: int = 5) -> list[dict[str, Any]]:
             .execute()
         )
         return list(getattr(response, "data", []) or [])
-    except Exception as exc:
-        _safe_console_log(f"[Parts] untranslated fetch failed: {exc}")
+    except Exception as exc:  # type: ignore
+        logger.error(f"[Parts] untranslated fetch failed: {exc}")
         return []
 
 
-def save_part_translation(part_number: str, translations: dict[str, Any]) -> dict[str, Any]:
+def save_part_translation(
+    part_number: str, translations: dict[str, Any]
+) -> dict[str, Any]:
     client = get_cached_supabase_client()
     if client is None:
         return {
@@ -1787,7 +2411,7 @@ def save_part_translation(part_number: str, translations: dict[str, Any]) -> dic
             "saved": True,
             "message": "parts 테이블에 translations를 저장했습니다.",
         }
-    except Exception as exc:
+    except Exception as exc:  # type: ignore
         return {
             "saved": False,
             "message": f"번역 저장 실패: {exc}",
@@ -1828,7 +2452,12 @@ def save_crawled_data(
         raw_json,
         source_type=source_type,
         status="crawled",
-        source_url=str(raw_json.get("final_url") or raw_json.get("source_url") or raw_json.get("url") or "").strip(),
+        source_url=str(
+            raw_json.get("final_url")
+            or raw_json.get("source_url")
+            or raw_json.get("url")
+            or ""
+        ).strip(),
         fallback_schema_key=schema_key,
         fallback_document_type=document_type,
         fallback_source_path_hint=source_path_hint,
@@ -1843,6 +2472,7 @@ def save_crawled_data(
             source_type=source_type,
             schema_key=schema_key,
             source_path_hint=source_path_hint,
+            exception=None,
             payload=raw_json,
         )
         return {
@@ -1935,6 +2565,7 @@ def save_crawled_data(
             source_type=source_type,
             schema_key=schema_key,
             source_path_hint=source_path_hint,
+            exception=exc,
             payload=raw_json,
         )
         return {
@@ -2004,7 +2635,6 @@ def persist_factory_rows(
             "status": row.get("status", ""),
         }
         assess_analysis_quality(payload)
-        row_has_content = has_meaningful_structured_content(payload) or bool(payload.get("summary"))
 
         if row.get("cache_hit"):
             skipped_count += 1
@@ -2019,19 +2649,24 @@ def persist_factory_rows(
                 source_type=source_type,
                 schema_key=schema_key,
                 source_path_hint=source_path_hint,
+                exception=None,
                 payload=payload,
             )
             continue
 
-        if not row_has_content:
+        quality_status = payload.get("quality_status")
+        if quality_status == "low":
             skipped_count += 1
+            score = payload.get("confidence_score", 0)
+            reasons = ",".join(payload.get("quality_reasons", []))
             log_dead_letter(
                 payload["source_url"],
-                f"empty_structured_payload: {payload.get('status', '') or row.get('skip_reason', '') or 'unknown'}",
+                f"low_quality_data: score={score}, reasons={reasons}",
                 final_url=payload["final_url"],
                 source_type=source_type,
                 schema_key=schema_key,
                 source_path_hint=source_path_hint,
+                exception=None,
                 payload=payload,
             )
             continue
@@ -2058,7 +2693,9 @@ def persist_factory_rows(
                     payload,
                     source_type=source_type,
                     status="pending",
-                    source_url=str(row.get("final_url") or row.get("url") or "").strip(),
+                    source_url=str(
+                        row.get("final_url") or row.get("url") or ""
+                    ).strip(),
                     fallback_schema_key=schema_key,
                     fallback_document_type=document_type,
                     fallback_source_path_hint=source_path_hint,
@@ -2091,6 +2728,7 @@ def persist_factory_rows(
                 source_type=source_type,
                 schema_key=schema_key,
                 source_path_hint=source_path_hint,
+                exception=exc,
                 payload=payload,
             )
 
@@ -2114,23 +2752,191 @@ def persist_factory_rows(
     }
 
 
-def fetch_dead_letters(limit: int = 200) -> list[dict[str, Any]]:
+def fetch_dead_letters(
+    limit: int = 200,
+    error_reason_keyword: str | None = None,
+    schema_key_filter: list[str] | None = None,
+    source_type_filter: list[str] | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    sort_by: str = "created_at",
+    sort_order: str = "desc",
+) -> list[dict[str, Any]]:
     client = get_cached_supabase_client()
     if client is None:
         return []
 
     try:
-        response = (
-            client.table(dead_letters_table_name())
-            .select("*")
-            .eq("resolved", False)
-            .limit(limit)
-            .execute()
+        query = (
+            client.table(dead_letters_table_name()).select("*").eq("resolved", False)
         )
+
+        if error_reason_keyword:
+            query = query.ilike("error_reason", f"%{error_reason_keyword}%")
+
+        if schema_key_filter:
+            # Assume schema_key column exists. If not, this will raise an error.
+            query = query.in_("schema_key", schema_key_filter)
+
+        if source_type_filter:
+            # Assume source_type column exists.
+            query = query.in_("source_type", source_type_filter)
+
+        if start_date:
+            query = query.gte("created_at", start_date)
+
+        if end_date:
+            # Add one day to end_date to include the entire day
+            end_datetime = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+            end_of_day = end_datetime.replace(
+                hour=23, minute=59, second=59, microsecond=999999
+            ).isoformat(timespec="microseconds")
+            query = query.lte("created_at", end_of_day)
+
+        # Validate sort_by column
+        valid_sort_columns = [
+            "created_at",
+            "updated_at",
+            "url",
+            "error_reason",
+            "schema_key",
+            "source_type",
+        ]
+        if sort_by not in valid_sort_columns:
+            sort_by = "created_at"  # Default to created_at if invalid
+
+        is_desc = sort_order.lower() == "desc"
+        query = query.order(sort_by, desc=is_desc)
+
+        response = query.limit(limit).execute()
         return list(getattr(response, "data", []) or [])
     except Exception as exc:
         _safe_console_log(f"[DLQ] fetch failed: {exc}")
         return []
+
+
+def resolve_dead_letter(item_id: Any) -> dict[str, Any]:
+    """Marks a dead letter item as resolved."""
+    client = get_cached_supabase_client()
+    if client is None:
+        return {
+            "saved": False,
+            "message": "Supabase가 설정되지 않아 dead letter를 처리할 수 없습니다.",
+        }
+
+    try:
+        client.table(dead_letters_table_name()).update(
+            {"resolved": True, "updated_at": _utc_now_iso()}
+        ).eq("id", item_id).execute()
+        return {
+            "saved": True,
+            "message": "dead_letters 항목을 resolved로 갱신했습니다.",
+        }
+    except Exception as exc:  # type: ignore
+        return {
+            "saved": False,
+            "message": f"Dead letter 처리 실패: {exc}",
+        }
+
+
+def delete_dead_letter(item_id: Any) -> dict[str, Any]:
+    """Permanently deletes a dead letter item."""
+    client = get_cached_supabase_client()
+    if client is None:
+        return {
+            "saved": False,
+            "message": "Supabase가 설정되지 않아 dead letter를 삭제할 수 없습니다.",
+        }
+
+    try:
+        client.table(dead_letters_table_name()).delete().eq("id", item_id).execute()
+        return {
+            "saved": True,
+            "message": "dead_letters 항목을 영구적으로 삭제했습니다.",
+        }
+    except Exception as exc:  # type: ignore
+        return {
+            "saved": False,
+            "message": f"Dead letter 삭제 실패: {exc}",
+        }
+
+
+def parse_dead_letter_metadata(error_reason: str) -> dict[str, str]:
+    """Parses metadata from the pipe-separated error_reason string."""
+    metadata = {}
+    if " | " not in error_reason:
+        return metadata
+
+    parts = error_reason.split(" | ")
+    for part in parts[1:]:  # Skip the main reason text
+        if "=" in part:
+            key, value = part.split("=", 1)
+            metadata[key.strip()] = value.strip()
+    return metadata
+
+
+def retry_dead_letter_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Retries a single dead letter item manually."""
+    item_id = item.get("id")
+    url = item.get("url")
+    error_reason = item.get("error_reason", "")
+    if not item_id or not url:
+        return {"success": False, "message": "Item ID 또는 URL이 없습니다."}
+
+    proxy_url, _ = get_config_prompt("proxy_url", "")
+    user_agent, _ = get_config_prompt("custom_user_agent", "")
+
+    # Prioritize new columns if available, otherwise parse from error_reason
+    schema_key = item.get("schema_key")
+    source_type = item.get("source_type")
+    source_path_hint = (
+        ""  # source_path_hint is not a direct column, still in error_reason metadata
+    )
+
+    if not schema_key or not source_type:
+        metadata = parse_dead_letter_metadata(error_reason)
+        schema_key = schema_key or metadata.get("schema_key", "path_detail")
+        source_type = source_type or metadata.get(
+            "source_type", "dead_letter_manual_retry"
+        )
+        source_path_hint = metadata.get("path_hint", "")  # Only parse if needed
+
+    try:
+        scraped_text = run_crawler_sync(
+            url,
+            proxy=proxy_url.strip() or None,
+            user_agent=user_agent.strip() or None,
+        )
+
+        if not scraped_text:
+            return {
+                "success": False,
+                "message": f"재시도 실패: {url}에서 콘텐츠를 크롤링할 수 없습니다.",
+            }
+
+        _, save_result = process_scraped_text_and_save(
+            scraped_text=scraped_text,
+            doc_type_key=schema_key,
+            market="GLOBAL",
+            destination="pending",  # Manual retries should always go to pending
+            source_path_hint=source_path_hint,
+            document_type=f"Manual Retry of {schema_key}",
+            source_url=url,
+            source_type_override=source_type,
+        )
+
+        if save_result.get("saved"):
+            resolve_dead_letter(item_id)  # Attempt to mark as resolved
+            return {
+                "success": True,
+                "message": "성공적으로 재처리하여 검수 대기열로 보냈습니다.",
+            }
+        return {
+            "success": False,
+            "message": f"처리된 데이터 저장 실패: {save_result.get('message')}",
+        }
+    except Exception as exc:
+        return {"success": False, "message": f"재처리 중 예기치 않은 오류 발생: {exc}"}
 
 
 def fetch_parts_export() -> list[dict[str, Any]]:
@@ -2152,10 +2958,14 @@ def fetch_parts_count() -> int:
         return 0
 
     try:
-        response = client.table(parts_table_name()).select("part_number", count="exact").execute()
+        response = (
+            client.table(parts_table_name())
+            .select("part_number", count="exact")
+            .execute()
+        )
         return int(getattr(response, "count", 0) or 0)
-    except Exception as exc:
-        _safe_console_log(f"[Parts] count fetch failed: {exc}")
+    except Exception as exc:  # type: ignore
+        logger.error(f"[Parts] export fetch failed: {exc}")
         return 0
 
 
@@ -2168,11 +2978,17 @@ def persist_review_decision(
 ) -> dict[str, Any]:
     review_payload = {
         "source_url": original_record.get("url", ""),
-        "final_url": reviewed_record.get("final_url") or original_record.get("final_url", ""),
-        "part_number": reviewed_record.get("part_number") or original_record.get("part_number") or "Unknown",
-        "oem_brand": reviewed_record.get("oem_brand") or original_record.get("oem_brand", ""),
-        "schema_key": reviewed_record.get("schema_key") or original_record.get("schema_key", ""),
-        "source_path_hint": reviewed_record.get("source_path_hint") or original_record.get("source_path_hint", ""),
+        "final_url": reviewed_record.get("final_url")
+        or original_record.get("final_url", ""),
+        "part_number": reviewed_record.get("part_number")
+        or original_record.get("part_number")
+        or "Unknown",
+        "oem_brand": reviewed_record.get("oem_brand")
+        or original_record.get("oem_brand", ""),
+        "schema_key": reviewed_record.get("schema_key")
+        or original_record.get("schema_key", ""),
+        "source_path_hint": reviewed_record.get("source_path_hint")
+        or original_record.get("source_path_hint", ""),
         "decision": decision,
         "notes": notes,
         "review_payload": reviewed_record,
@@ -2194,21 +3010,24 @@ def persist_review_decision(
                     or original_record.get("part_number")
                     or "Unknown"
                 )
-                resolved_oem_brand = reviewed_record.get("oem_brand") or original_record.get("oem_brand", "")
-                resolved_schema_key = reviewed_record.get("schema_key") or original_record.get("schema_key", "")
-                resolved_source_path_hint = (
-                    reviewed_record.get("source_path_hint")
-                    or original_record.get("source_path_hint", "")
+                resolved_oem_brand = reviewed_record.get(
+                    "oem_brand"
+                ) or original_record.get("oem_brand", "")
+                resolved_schema_key = reviewed_record.get(
+                    "schema_key"
+                ) or original_record.get("schema_key", "")
+                resolved_source_path_hint = reviewed_record.get(
+                    "source_path_hint"
+                ) or original_record.get("source_path_hint", "")
+                resolved_market = reviewed_record.get("market") or original_record.get(
+                    "market", "GLOBAL"
                 )
-                resolved_market = reviewed_record.get("market") or original_record.get("market", "GLOBAL")
-                resolved_document_type = (
-                    reviewed_record.get("document_type")
-                    or original_record.get("document_type", "")
-                )
-                resolved_source_type = (
-                    reviewed_record.get("source_type")
-                    or original_record.get("source_type", "")
-                )
+                resolved_document_type = reviewed_record.get(
+                    "document_type"
+                ) or original_record.get("document_type", "")
+                resolved_source_type = reviewed_record.get(
+                    "source_type"
+                ) or original_record.get("source_type", "")
 
                 client.table(parts_table_name()).upsert(
                     {

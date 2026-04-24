@@ -35,6 +35,9 @@ if TYPE_CHECKING:
 
 
 load_dotenv()
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
@@ -77,15 +80,21 @@ class FetchResult:
 class CrawlRunResult:
     start_url: str
     target_market: str
-    queued_urls: list[str]
+    total_queued_for_processing: int = 0
+    total_processed_by_ai: int = 0
     rows: list[dict[str, Any]]
     route_status_counts: dict[str, int]
     log_lines: list[str]
 
 
 class CallbackWriter(io.TextIOBase):
-    def __init__(self, callback: Callable[[str], None] | None = None):
-        self.callback = callback
+    def __init__(
+        self,
+        log_callback: Callable[[str], None] | None = None,
+        progress_text_callback: Callable[[str], None] | None = None,
+    ):
+        self.log_callback = log_callback
+        self.progress_text_callback = progress_text_callback
         self.lines: list[str] = []
         self._buffer = ""
 
@@ -97,18 +106,20 @@ class CallbackWriter(io.TextIOBase):
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
             if line:
-                self.lines.append(line)
-                if self.callback is not None:
-                    self.callback(line)
+                self.lines.append(line.strip())  # Store stripped line
+                if self.log_callback is not None:
+                    self.log_callback(line.strip())
+                if self.progress_text_callback is not None:
+                    self.progress_text_callback(line.strip())
         return len(text)
 
     def flush(self) -> None:
         if self._buffer:
             line = self._buffer
             self._buffer = ""
-            self.lines.append(line)
-            if self.callback is not None:
-                self.callback(line)
+            self.lines.append(line.strip())
+            if self.log_callback is not None:
+                self.log_callback(line.strip())
 
 
 def env_flag(name: str, default: bool) -> bool:
@@ -163,7 +174,9 @@ def build_proxy_config() -> dict[str, str] | None:
 
 def build_supabase_client():
     if create_client is None:
-        print("[Setup] `supabase` is not installed. Cache and DB writes are disabled.")
+        logger.warning(
+            "[Setup] `supabase` is not installed. Cache and DB writes are disabled."
+        )
         return None
 
     supabase_url = os.getenv("NEXT_PUBLIC_SUPABASE_URL", "").strip()
@@ -174,14 +187,18 @@ def build_supabase_client():
     )
 
     if not supabase_url or not supabase_key:
-        print("[Setup] Supabase env vars are missing. Cache and DB writes are disabled.")
+        logger.warning(
+            "[Setup] Supabase env vars are missing. Cache and DB writes are disabled."
+        )
         return None
 
     if not (
         os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
         or os.getenv("SUPABASE_SECRET_KEY", "").strip()
     ):
-        print("[Setup] Using NEXT_PUBLIC_SUPABASE_ANON_KEY fallback. Write access depends on Supabase policies.")
+        logger.warning(
+            "[Setup] Using NEXT_PUBLIC_SUPABASE_ANON_KEY fallback. Write access depends on Supabase policies."
+        )
 
     return create_client(supabase_url, supabase_key)
 
@@ -201,7 +218,10 @@ def gemini_candidate_models(preferred_model: str | None = None) -> list[str]:
     primary_model = normalize_gemini_model_name(
         preferred_model or os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
     )
-    for raw_name in [primary_model, *env_csv_list("GEMINI_FALLBACK_MODELS", DEFAULT_GEMINI_FALLBACK_MODELS)]:
+    for raw_name in [
+        primary_model,
+        *env_csv_list("GEMINI_FALLBACK_MODELS", DEFAULT_GEMINI_FALLBACK_MODELS),
+    ]:
         normalized = normalize_gemini_model_name(raw_name)
         if normalized and normalized not in candidates:
             candidates.append(normalized)
@@ -210,15 +230,16 @@ def gemini_candidate_models(preferred_model: str | None = None) -> list[str]:
 
 def is_gemini_model_not_found_error(exc: Exception) -> bool:
     text = str(exc).lower()
-    return (
-        ("not found" in text or "not_found" in text)
-        and ("model" in text or "models/" in text)
+    return ("not found" in text or "not_found" in text) and (
+        "model" in text or "models/" in text
     )
 
 
 def build_llm(model_name: str | None = None):
     if ChatGoogleGenerativeAI is None:
-        print("[Setup] `langchain-google-genai` is not installed. AI extraction is disabled.")
+        logger.warning(
+            "[Setup] `langchain-google-genai` is not installed. AI extraction is disabled."
+        )
         return None
 
     google_api_key = (
@@ -230,7 +251,9 @@ def build_llm(model_name: str | None = None):
         return None
 
     return ChatGoogleGenerativeAI(
-        model=normalize_gemini_model_name(model_name or os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)),
+        model=normalize_gemini_model_name(
+            model_name or os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+        ),
         temperature=0,
         google_api_key=google_api_key,
     )
@@ -247,12 +270,19 @@ def invoke_llm_with_fallback(
         if llm is None:
             return None
 
-        target = llm.with_structured_output(structured_schema) if structured_schema is not None else llm
+        target = (
+            llm.with_structured_output(structured_schema)
+            if structured_schema is not None
+            else llm
+        )
         try:
             return target.invoke(payload)
         except Exception as exc:
             if is_gemini_model_not_found_error(exc):
-                logger.warning("[Gemini] model `%s` is not available. Trying next fallback.", model_name)
+                logger.warning(
+                    "[Gemini] model `%s` is not available. Trying next fallback.",
+                    model_name,
+                )
                 last_error = exc
                 continue
             raise
@@ -332,13 +362,17 @@ class WevikoSpider:
         self.discovery_max_pages = max(discovery_max_pages, 1)
         self.discovery_max_matches = max(discovery_max_matches, 1)
         self.discovery_max_depth = max(discovery_max_depth, 0)
-        self.extra_path_hints = tuple(()) if extra_path_hints is None else tuple(extra_path_hints)
+        self.extra_path_hints = (
+            tuple(()) if extra_path_hints is None else tuple(extra_path_hints)
+        )
         self.route_watch_hints = (
             tuple(("/parts", "/dashboard"))
             if route_watch_hints is None
             else tuple(route_watch_hints)
         )
-        self.max_queue_urls = max_queue_urls if max_queue_urls and max_queue_urls > 0 else None
+        self.max_queue_urls = (
+            max_queue_urls if max_queue_urls and max_queue_urls > 0 else None
+        )
 
     def normalize_url(self, url: str) -> str:
         parsed = urlsplit(url)
@@ -386,7 +420,9 @@ class WevikoSpider:
         return any(self.path_matches_hint(path, hint) for hint in self.all_hints())
 
     def path_matches_route_watch_hint(self, path: str) -> bool:
-        return any(self.path_matches_hint(path, hint) for hint in self.all_route_watch_hints())
+        return any(
+            self.path_matches_hint(path, hint) for hint in self.all_route_watch_hints()
+        )
 
     def is_detail_candidate(self, path: str, hint: str | None = None) -> bool:
         hint = self.normalized_hint() if hint is None else self.normalize_hint(hint)
@@ -413,7 +449,9 @@ class WevikoSpider:
             for selector in selectors:
                 for anchor in soup.select(selector):
                     href = anchor.get("href", "").strip()
-                    if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
+                    if not href or href.startswith(
+                        ("javascript:", "mailto:", "tel:", "#")
+                    ):
                         continue
 
                     candidate = self.normalize_url(urljoin(current_url, href))
@@ -441,17 +479,26 @@ class WevikoSpider:
         normalized_url = self.normalize_url(url.split("#", 1)[0])
         if normalized_url in self.visited_urls:
             return False
-        if self.max_queue_urls is not None and len(self.queued_urls) >= self.max_queue_urls:
+        if (
+            self.max_queue_urls is not None
+            and len(self.queued_urls) >= self.max_queue_urls
+        ):
             return False
 
-        await self.url_queue.put(normalized_url)
+        await self.url_queue.put(normalized_url)  # type: ignore
         self.visited_urls.add(normalized_url)
         self.queued_urls.append(normalized_url)
-        print(f"   [Spider] queued: {normalized_url}")
+        logger.info(f"   [Spider] queued: {normalized_url}")
         return True
 
+    async def enqueue_urls_from_list(self, urls: list[str]) -> None:
+        logger.info(f"[Spider] Enqueuing {len(urls)} URLs from provided list.")
+        for url in urls:
+            await self.enqueue_url(url)
+        logger.info("[Spider] Finished enqueuing initial URLs.")
+
     async def discover_urls(self, start_url: str) -> None:
-        print(f"[Spider] discovering product URLs from: {start_url}")
+        logger.info(f"[Spider] discovering product URLs from: {start_url}")
 
         headers = {
             "User-Agent": (
@@ -484,7 +531,9 @@ class WevikoSpider:
                         response.raise_for_status()
                         html = await response.text()
                 except Exception as exc:
-                    print(f"[Spider] discovery fetch failed for {current_url}: {exc}")
+                    logger.error(
+                        f"[Spider] discovery fetch failed for {current_url}: {exc}"
+                    )
                     continue
 
                 current_path = urlparse(current_url).path or "/"
@@ -505,17 +554,25 @@ class WevikoSpider:
                     start_host=start_host,
                     prefer_content_links=current_is_detail,
                 ):
-                    candidate_matches_content_hint = self.path_matches_any_hint(candidate_path)
-                    candidate_matches_route_watch = self.path_matches_route_watch_hint(candidate_path)
+                    candidate_matches_content_hint = self.path_matches_any_hint(
+                        candidate_path
+                    )
+                    candidate_matches_route_watch = self.path_matches_route_watch_hint(
+                        candidate_path
+                    )
 
-                    if candidate_matches_route_watch and candidate not in self.visited_urls:
+                    if (
+                        candidate_matches_route_watch
+                        and candidate not in self.visited_urls
+                    ):
                         await self.enqueue_url(candidate)
 
                     if not candidate_matches_content_hint:
                         continue
 
                     candidate_is_detail = any(
-                        self.is_detail_candidate(candidate_path, hint) for hint in hint_paths
+                        self.is_detail_candidate(candidate_path, hint)
+                        for hint in hint_paths
                     )
 
                     if candidate_is_detail:
@@ -537,11 +594,15 @@ class WevikoSpider:
 
         if discovered_detail_urls == 0:
             if fallback_urls:
-                print("[Spider] no detail pages found. Queueing matched category pages as fallback.")
+                logger.info(
+                    "[Spider] no detail pages found. Queueing matched category pages as fallback."
+                )
                 for candidate in fallback_urls[: self.discovery_max_matches]:
                     await self.enqueue_url(candidate)
             else:
-                print("[Spider] no matching candidates found. Falling back to the start URL.")
+                logger.info(
+                    "[Spider] no matching candidates found. Falling back to the start URL."
+                )
                 await self.enqueue_url(normalized_start_url)
 
 
@@ -601,19 +662,27 @@ class WevikoWorker:
 
         return "content_page", "public_content"
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    @retry(
+        stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
     async def fetch_page(self, context: "BrowserContext", url: str) -> FetchResult:
         blocked = ", ".join(sorted(self.blocked_resource_types)) or "none"
-        print(f"[Worker-{self.worker_id}] fetching with blocked resources [{blocked}]: {url}")
+        logger.debug(
+            f"[Worker-{self.worker_id}] fetching with blocked resources [{blocked}]: {url}"
+        )
         page = await context.new_page()
 
         try:
-            response = await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+            response = await page.goto(
+                url, timeout=30000, wait_until="domcontentloaded"
+            )
             await page.wait_for_timeout(2000)
             html = await page.content()
             final_url = page.url
             status_code = response.status if response is not None else None
-            route_status, route_reason = self.classify_route(url, final_url, status_code, html)
+            route_status, route_reason = self.classify_route(
+                url, final_url, status_code, html
+            )
             return FetchResult(
                 requested_url=url,
                 final_url=final_url,
@@ -649,7 +718,9 @@ class WevikoWorker:
         if not kept_lines:
             return clean_markdown[: self.fallback_chars]
 
-        compressed_markdown = "\n".join(lines[index] for index in sorted(kept_lines)).strip()
+        compressed_markdown = "\n".join(
+            lines[index] for index in sorted(kept_lines)
+        ).strip()
         if not compressed_markdown:
             return clean_markdown[: self.fallback_chars]
         return compressed_markdown[: self.compressed_chars]
@@ -673,7 +744,9 @@ class WevikoCrawler:
         self.blocked_resource_types = set(
             blocked_resource_types or {"image", "media", "font", "stylesheet"}
         )
-        self.headless = env_flag("WEVIKO_HEADLESS", True) if headless is None else headless
+        self.headless = (
+            env_flag("WEVIKO_HEADLESS", True) if headless is None else headless
+        )
 
     async def _intercept_route(self, route) -> None:
         if route.request.resource_type in self.blocked_resource_types:
@@ -692,7 +765,7 @@ class WevikoCrawler:
             from playwright.async_api import async_playwright
             from playwright_stealth import Stealth
         except ImportError as exc:
-            logger.error("Playwright import failed: %s", exc)
+            logger.error("Playwright import failed: %s", exc, exc_info=True)
             return None
 
         browser_kwargs: dict[str, Any] = {"headless": self.headless}
@@ -706,22 +779,30 @@ class WevikoCrawler:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(**browser_kwargs)
             try:
-                context = await browser.new_context(user_agent=self.user_agent, locale="en-US")
+                context = await browser.new_context(
+                    user_agent=self.user_agent, locale="en-US"
+                )
                 page = await context.new_page()
                 await Stealth().apply_stealth_async(page)
                 await page.route("**/*", self._intercept_route)
 
                 logger.info("접속 시도: %s", url)
                 try:
-                    response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    response = await page.goto(
+                        url, wait_until="domcontentloaded", timeout=30000
+                    )
                     await page.wait_for_timeout(2000)
                     raw_html = await page.content()
                     clean_text = self._compress_html(raw_html)
                     status_code = response.status if response is not None else "unknown"
-                    logger.info("수집 성공: 텍스트 길이 %s자 (status=%s)", len(clean_text), status_code)
+                    logger.info(
+                        "수집 성공: 텍스트 길이 %s자 (status=%s)",
+                        len(clean_text),
+                        status_code,
+                    )
                     return clean_text
                 except Exception as exc:
-                    logger.error("수집 실패 (%s): %s", url, exc)
+                    logger.error("수집 실패 (%s): %s", url, exc, exc_info=True)
                     return None
                 finally:
                     await page.close()
@@ -741,6 +822,11 @@ class WevikoBrain:
         schema_key: str = "path_detail",
         source_type: str = "crawl_factory",
         target_market: str = "GLOBAL",
+        total_urls_to_process: int = 0,
+        job_progress_callback: (
+            Callable[[int, int, str], None] | None
+        ) = None,  # Callback for worker to update Supabase
+        progress_update_callback: Callable[[int, int], None] | None = None,
     ):
         self.supabase = supabase_client
         self.llm = llm
@@ -750,6 +836,10 @@ class WevikoBrain:
         self.schema_key = schema_key
         self.source_type = source_type
         self.target_market = target_market
+        self.processed_urls_count = 0
+        self.total_urls_to_process = total_urls_to_process
+        self.job_progress_callback = job_progress_callback  # Store this callback
+        self.progress_update_callback = progress_update_callback
         self.route_status_counts: dict[str, int] = {}
         self.rows: list[dict[str, Any]] = []
         self.rows_by_url: dict[str, dict[str, Any]] = {}
@@ -762,7 +852,7 @@ class WevikoBrain:
             return False
 
         try:
-            response = (
+            response = (  # type: ignore
                 self.supabase.table(self.cache_table)
                 .select("id")
                 .eq("content_hash", content_hash)
@@ -771,15 +861,17 @@ class WevikoBrain:
             )
             return bool(getattr(response, "data", None))
         except Exception as exc:
-            print(f"[Cache] lookup failed. Continuing without cache: {exc}")
+            logger.warning(f"[Cache] lookup failed. Continuing without cache: {exc}")
             return False
 
-    def _persist_result(self, url: str, content_hash: str, result: FactData | None) -> None:
+    def _persist_result(
+        self, url: str, content_hash: str, result: FactData | None
+    ) -> None:
         if self.supabase is None:
             return
 
         try:
-            timestamp = datetime.now(timezone.utc).isoformat()
+            timestamp = datetime.now(timezone.utc).isoformat()  # type: ignore
             (
                 self.supabase.table(self.cache_table)
                 .upsert(
@@ -811,7 +903,9 @@ class WevikoBrain:
                     .execute()
                 )
         except Exception as exc:
-            print(f"[DB] write failed. Continuing with the next URL: {exc}")
+            logger.error(
+                f"[DB] write failed. Continuing with the next URL: {exc}", exc_info=True
+            )
 
     def _ensure_row(self, fetch_result: FetchResult) -> dict[str, Any]:
         row = self.rows_by_url.get(fetch_result.requested_url)
@@ -853,7 +947,14 @@ class WevikoBrain:
     def record_route_status(self, fetch_result: FetchResult) -> None:
         route_status = fetch_result.route_status
         row = self._ensure_row(fetch_result)
-        self.route_status_counts[route_status] = self.route_status_counts.get(route_status, 0) + 1
+        self.route_status_counts[route_status] = (
+            self.route_status_counts.get(route_status, 0) + 1
+        )
+        self.processed_urls_count += 1
+        if self.progress_update_callback:
+            self.progress_update_callback(
+                self.processed_urls_count, self.total_urls_to_process
+            )
 
         if route_status == "content_page":
             row["status"] = "Fetched"
@@ -872,9 +973,11 @@ class WevikoBrain:
         if fetch_result.final_url != fetch_result.requested_url:
             extra = f" -> {fetch_result.final_url}"
         status_fragment = (
-            f", status={fetch_result.status_code}" if fetch_result.status_code is not None else ""
+            f", status={fetch_result.status_code}"
+            if fetch_result.status_code is not None
+            else ""
         )
-        print(
+        logger.debug(
             f"[Route] {route_status}: {fetch_result.requested_url}{extra} "
             f"({fetch_result.route_reason}{status_fragment})"
         )
@@ -890,9 +993,10 @@ class WevikoBrain:
             return
 
         summary = ", ".join(
-            f"{route_status}={count}" for route_status, count in sorted(self.route_status_counts.items())
+            f"{route_status}={count}"
+            for route_status, count in sorted(self.route_status_counts.items())
         )
-        print(f"[Route Summary] {summary}")
+        logger.info(f"[Route Summary] {summary}")
 
     async def check_cache_and_extract(
         self,
@@ -908,17 +1012,21 @@ class WevikoBrain:
             row["status"] = "Cache Hit"
             row["cache_hit"] = True
             row["skip_reason"] = "cache_hit"
-            print(f"[Cache Hit] no content change. Skipping AI extraction: {url}")
+            logger.debug(
+                f"[Cache Hit] no content change. Skipping AI extraction: {url}"
+            )
             return None
 
         if self.llm is None:
             row["status"] = "Content Captured"
             row["skip_reason"] = "model_unavailable"
-            print(f"[AI] model unavailable. Storing raw crawl metadata only: {url}")
+            logger.warning(
+                f"[AI] model unavailable. Storing raw crawl metadata only: {url}"
+            )
             self._persist_result(url, content_hash, None)
             return None
 
-        print(
+        logger.debug(
             f"[AI] new content detected. Starting structured extraction "
             f"from {len(compressed_markdown)} characters..."
         )
@@ -935,7 +1043,9 @@ class WevikoBrain:
         if result is None:
             row["status"] = "Model Unavailable"
             row["skip_reason"] = "model_unavailable"
-            print(f"[AI] no supported Gemini model is available right now: {url}")
+            logger.error(
+                f"[AI] no supported Gemini model is available right now: {url}"
+            )
             self._persist_result(url, content_hash, None)
             return None
 
@@ -953,7 +1063,7 @@ class WevikoBrain:
         row["cautions"] = result.cautions
         row["skip_reason"] = ""
         self._persist_result(url, content_hash, result)
-        print(f"   -> processed successfully (hash: {content_hash[:8]}...)")
+        logger.debug(f"   -> processed successfully (hash: {content_hash[:8]}...)")
         return result
 
 
@@ -987,11 +1097,16 @@ async def crawl_worker_task(
             compressed_markdown = worker.process_and_compress_html(fetch_result.html)
             if not compressed_markdown:
                 brain.record_empty_content(fetch_result)
-                print(f"[Worker-{worker_id}] extracted no useful text. Skipping: {url}")
+                logger.debug(
+                    f"[Worker-{worker_id}] extracted no useful text. Skipping: {url}"
+                )
                 continue
             await brain.check_cache_and_extract(fetch_result, compressed_markdown)
-        except Exception as exc:
-            print(f"[Worker-{worker_id}] failed after retries ({url}): {exc}")
+        except Exception as exc:  # type: ignore
+            logger.error(
+                f"[Worker-{worker_id}] failed after retries ({url}): {exc}",
+                exc_info=True,
+            )
         finally:
             spider.url_queue.task_done()
 
@@ -999,6 +1114,7 @@ async def crawl_worker_task(
 async def run_factory_async(
     *,
     start_url: str | None = None,
+    initial_urls: list[str] | None = None,  # New parameter
     num_workers: int | None = None,
     target_market: str = "GLOBAL",
     product_path_hint: str | None = None,
@@ -1013,26 +1129,45 @@ async def run_factory_async(
     write_destination: str = "parts",
     schema_key: str = "path_detail",
     source_type: str = "crawl_factory",
+    job_progress_callback: (
+        Callable[[int, int, str], None] | None
+    ) = None,  # Pass this down to WevikoBrain
+    progress_update_callback: Callable[[int, int], None] | None = None,
 ) -> CrawlRunResult:
-    print("Starting Weviko crawling pipeline...\n")
+    logger.info("Starting Weviko crawling pipeline...\n")
 
-    resolved_start_url = start_url or os.getenv("WEVIKO_TARGET_URL", "https://www.weviko.com")
-    resolved_num_workers = num_workers or env_int("WEVIKO_NUM_WORKERS", 3)
-    resolved_discovery_max_matches = (
-        max_urls if max_urls is not None else discovery_max_matches
+    resolved_start_url = start_url or os.getenv(
+        "WEVIKO_TARGET_URL", "https://www.weviko.com"
     )
+    resolved_num_workers = num_workers or env_int("WEVIKO_NUM_WORKERS", 3)
+
+    # Adjust discovery parameters if initial_urls are provided
+    if initial_urls:
+        resolved_discovery_max_matches = len(initial_urls)
+        discovery_max_depth = 0  # No discovery needed
+        discovery_max_pages = 0  # No discovery needed
+    else:
+        resolved_discovery_max_matches = (
+            max_urls if max_urls is not None else discovery_max_matches
+        )
+
     spider = WevikoSpider(
         product_path_hint=(
             os.getenv("WEVIKO_PRODUCT_PATH_HINT", "/part/")
             if product_path_hint is None
             else product_path_hint
         ),
-        discovery_max_pages=discovery_max_pages or env_int("WEVIKO_DISCOVERY_MAX_PAGES", 12),
+        discovery_max_pages=discovery_max_pages
+        or env_int("WEVIKO_DISCOVERY_MAX_PAGES", 12),
         discovery_max_matches=(
             resolved_discovery_max_matches
             or env_int("WEVIKO_DISCOVERY_MAX_MATCHES", 20)
         ),
-        discovery_max_depth=discovery_max_depth or env_int("WEVIKO_DISCOVERY_MAX_DEPTH", 2),
+        discovery_max_depth=(
+            discovery_max_depth
+            if initial_urls
+            else (discovery_max_depth or env_int("WEVIKO_DISCOVERY_MAX_DEPTH", 2))
+        ),
         extra_path_hints=(
             env_csv_list("WEVIKO_DISCOVERY_EXTRA_PATH_HINTS", ())
             if discovery_extra_path_hints is None
@@ -1043,7 +1178,9 @@ async def run_factory_async(
             if route_watch_hints is None
             else list(route_watch_hints)
         ),
-        max_queue_urls=max_urls,
+        max_queue_urls=(
+            max_urls if initial_urls is None else len(initial_urls)
+        ),  # Limit queue to initial_urls count
     )
     brain = WevikoBrain(
         supabase_client=build_supabase_client(),
@@ -1054,15 +1191,22 @@ async def run_factory_async(
         schema_key=schema_key,
         source_type=source_type,
         target_market=target_market,
+        job_progress_callback=job_progress_callback,  # Pass to WevikoBrain
+        total_urls_to_process=len(spider.queued_urls),
+        progress_update_callback=progress_update_callback,
     )
-    await spider.discover_urls(resolved_start_url)
+    if initial_urls:
+        await spider.enqueue_urls_from_list(initial_urls)
+    else:
+        await spider.discover_urls(resolved_start_url)
 
     if spider.url_queue.empty():
-        print("[Setup] no URLs were queued. Exiting.")
+        logger.warning("[Setup] no URLs were queued. Exiting.")
         return CrawlRunResult(
             start_url=resolved_start_url,
             target_market=target_market,
-            queued_urls=[],
+            total_queued_for_processing=0,
+            total_processed_by_ai=0,
             rows=[],
             route_status_counts=dict(brain.route_status_counts),
             log_lines=[],
@@ -1072,14 +1216,21 @@ async def run_factory_async(
         from playwright.async_api import async_playwright
         from playwright_stealth import Stealth
     except ImportError as exc:
-        print("[Setup] Playwright failed to import in this environment.")
-        print(f"   -> {exc}")
-        print("   -> On this machine, the current Python 3.14 environment is failing in the Playwright/greenlet layer.")
-        print("   -> Creating a fresh Python 3.12 or 3.13 virtual environment is the safest next step.")
+        logger.critical(
+            "Playwright failed to import in this environment.", exc_info=True
+        )
+        logger.critical(f"   -> {exc}")
+        logger.critical(
+            "   -> On this machine, the current Python 3.14 environment is failing in the Playwright/greenlet layer."
+        )
+        logger.critical(
+            "   -> Creating a fresh Python 3.12 or 3.13 virtual environment is the safest next step."
+        )
         return CrawlRunResult(
             start_url=resolved_start_url,
             target_market=target_market,
-            queued_urls=list(spider.queued_urls),
+            total_queued_for_processing=len(spider.queued_urls),
+            total_processed_by_ai=brain.processed_urls_count,
             rows=list(brain.rows),
             route_status_counts=dict(brain.route_status_counts),
             log_lines=[],
@@ -1109,6 +1260,7 @@ async def run_factory_async(
                 else set(blocked_resource_types)
             )
             if resolved_blocked_resource_types:
+
                 async def route_intercept(route):
                     if route.request.resource_type in resolved_blocked_resource_types:
                         await route.abort()
@@ -1140,12 +1292,13 @@ async def run_factory_async(
         finally:
             await browser.close()
 
-    print("\nCrawling and extraction completed.")
+    logger.info("\nCrawling and extraction completed.")
     brain.print_route_summary()
     return CrawlRunResult(
         start_url=resolved_start_url,
         target_market=target_market,
-        queued_urls=list(spider.queued_urls),
+        total_queued_for_processing=len(spider.queued_urls),
+        total_processed_by_ai=brain.processed_urls_count,
         rows=list(brain.rows),
         route_status_counts=dict(brain.route_status_counts),
         log_lines=[],
@@ -1155,6 +1308,7 @@ async def run_factory_async(
 def run_factory(
     *,
     start_url: str | None = None,
+    initial_urls: list[str] | None = None,  # Added initial_urls parameter
     num_workers: int | None = None,
     target_market: str = "GLOBAL",
     product_path_hint: str | None = None,
@@ -1169,13 +1323,19 @@ def run_factory(
     write_destination: str = "parts",
     schema_key: str = "path_detail",
     source_type: str = "crawl_factory",
+    job_progress_callback: (
+        Callable[[int, int, str], None] | None
+    ) = None,  # New parameter for scheduler worker
     log_callback: Callable[[str], None] | None = None,
+    progress_text_callback: Callable[[str], None] | None = None,  # New parameter
+    progress_update_callback: Callable[[int, int], None] | None = None,
 ) -> CrawlRunResult:
-    capture = CallbackWriter(log_callback)
+    capture = CallbackWriter(log_callback, progress_text_callback)
     with contextlib.redirect_stdout(capture):
         result = asyncio.run(
             run_factory_async(
                 start_url=start_url,
+                initial_urls=initial_urls,
                 num_workers=num_workers,
                 target_market=target_market,
                 product_path_hint=product_path_hint,
@@ -1190,6 +1350,8 @@ def run_factory(
                 write_destination=write_destination,
                 schema_key=schema_key,
                 source_type=source_type,
+                job_progress_callback=job_progress_callback,  # Pass to async function
+                progress_update_callback=progress_update_callback,
             )
         )
     capture.flush()
